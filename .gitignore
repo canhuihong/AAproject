@@ -9,7 +9,7 @@ ENV/
 data/prices/
 data/fundamentals/
 outputs/
-data/quant_lab.db
+data/quant_lab_v2.db
 
 # Python
 __pycache__/

@@ -1,0 +1,110 @@
+============================================================
+📝 日志记录已启动: 2025-12-19 16:17:36.042694
+📂 输出文件位置: C:\AAproject\debug_log.txt
+============================================================
+
+🌐 System Proxy Configured: http://127.0.0.1:7897
+
+============================================================
+📢 [PART 1] LIVE MARKET RECOMMENDATION (实盘建议)
+============================================================
+✅ Top Candidates: ['CVI', 'PARR', 'UNIT', 'TPR', 'APP', 'TGTX', 'CWEN-A', 'EXPE', 'SOLV', 'AAMI']
+
+⚙️  Optimizing allocation for 2025-12-19...
+
+🏆 Final Recommended Portfolio:
+   ticker  weight
+3  CWEN-A  22.49%
+8     TPR  22.25%
+1     APP  22.17%
+0    AAMI  18.85%
+7    TGTX  10.95%
+4    EXPE   3.30%
+
+############################################################
+⬇️  Running Backtest... ⬇️
+############################################################
+
+
+============================================================
+⏳ [PART 2] HISTORICAL BACKTEST VERIFICATION (历史回测)
+============================================================
+2025-12-19 16:17:45 - Backtest - INFO - 📅 Backtest Range: 2023-01-31 -> 2025-12-18
+2025-12-19 16:17:45 - Backtest - INFO - 🔄 Processing 2023-01-31 | Capital: $100,000
+2025-12-19 16:17:49 - Backtest - WARNING -    ⚠️ No stocks selected. Holding Cash.
+2025-12-19 16:17:49 - Backtest - INFO - 🔄 Processing 2023-02-28 | Capital: $100,000
+2025-12-19 16:17:52 - Backtest - WARNING -    ⚠️ No stocks selected. Holding Cash.
+2025-12-19 16:17:52 - Backtest - INFO - 🔄 Processing 2023-03-31 | Capital: $100,000
+2025-12-19 16:17:55 - Backtest - WARNING -    ⚠️ No stocks selected. Holding Cash.
+2025-12-19 16:17:55 - Backtest - INFO - 🔄 Processing 2023-04-28 | Capital: $100,000
+2025-12-19 16:17:59 - Backtest - WARNING -    ⚠️ No stocks selected. Holding Cash.
+2025-12-19 16:17:59 - Backtest - INFO - 🔄 Processing 2023-05-31 | Capital: $100,000
+2025-12-19 16:18:02 - Backtest - WARNING -    ⚠️ No stocks selected. Holding Cash.
+2025-12-19 16:18:02 - Backtest - INFO - 🔄 Processing 2023-06-30 | Capital: $100,000
+2025-12-19 16:18:06 - Backtest - WARNING -    ⚠️ No stocks selected. Holding Cash.
+2025-12-19 16:18:06 - Backtest - INFO - 🔄 Processing 2023-07-31 | Capital: $100,000
+2025-12-19 16:18:10 - Backtest - WARNING -    ⚠️ No stocks selected. Holding Cash.
+2025-12-19 16:18:10 - Backtest - INFO - 🔄 Processing 2023-08-31 | Capital: $100,000
+2025-12-19 16:18:14 - Backtest - WARNING -    ⚠️ No stocks selected. Holding Cash.
+2025-12-19 16:18:14 - Backtest - INFO - 🔄 Processing 2023-09-29 | Capital: $100,000
+2025-12-19 16:18:18 - Backtest - WARNING -    ⚠️ No stocks selected. Holding Cash.
+2025-12-19 16:18:18 - Backtest - INFO - 🔄 Processing 2023-10-31 | Capital: $100,000
+2025-12-19 16:18:22 - Backtest - WARNING -    ⚠️ No stocks selected. Holding Cash.
+2025-12-19 16:18:22 - Backtest - INFO - 🔄 Processing 2023-11-30 | Capital: $100,000
+2025-12-19 16:18:27 - Backtest - WARNING -    ⚠️ No stocks selected. Holding Cash.
+2025-12-19 16:18:27 - Backtest - INFO - 🔄 Processing 2023-12-29 | Capital: $100,000
+2025-12-19 16:18:31 - Backtest - WARNING -    ⚠️ No stocks selected. Holding Cash.
+2025-12-19 16:18:31 - Backtest - INFO - 🔄 Processing 2024-01-31 | Capital: $100,000
+2025-12-19 16:18:36 - Backtest - WARNING -    ⚠️ No stocks selected. Holding Cash.
+2025-12-19 16:18:36 - Backtest - INFO - 🔄 Processing 2024-02-29 | Capital: $100,000
+2025-12-19 16:18:41 - Backtest - WARNING -    ⚠️ No stocks selected. Holding Cash.
+2025-12-19 16:18:41 - Backtest - INFO - 🔄 Processing 2024-03-28 | Capital: $100,000
+2025-12-19 16:18:46 - Backtest - WARNING -    ⚠️ No stocks selected. Holding Cash.
+2025-12-19 16:18:46 - Backtest - INFO - 🔄 Processing 2024-04-30 | Capital: $100,000
+2025-12-19 16:18:51 - Backtest - WARNING -    ⚠️ No stocks selected. Holding Cash.
+2025-12-19 16:18:51 - Backtest - INFO - 🔄 Processing 2024-05-31 | Capital: $100,000
+2025-12-19 16:18:56 - Backtest - INFO -    ✅ Position: 1 stocks (Top: ['PFS']...)
+2025-12-19 16:18:56 - Backtest - INFO - 🔄 Processing 2024-06-28 | Capital: $99,653
+2025-12-19 16:19:02 - Backtest - INFO -    ✅ Position: 1 stocks (Top: ['PFS']...)
+2025-12-19 16:19:02 - Backtest - INFO - 🔄 Processing 2024-07-31 | Capital: $128,750
+2025-12-19 16:19:08 - Backtest - INFO -    ✅ Position: 1 stocks (Top: ['PFS']...)
+2025-12-19 16:19:08 - Backtest - INFO - 🔄 Processing 2024-08-30 | Capital: $134,213
+2025-12-19 16:19:14 - Backtest - INFO -    ✅ Position: 2 stocks (Top: ['BRK-B', 'CSW']...)
+2025-12-19 16:19:14 - Backtest - INFO - 🔄 Processing 2024-09-30 | Capital: $135,373
+2025-12-19 16:19:20 - Backtest - INFO -    ✅ Position: 2 stocks (Top: ['BRK-B', 'CSW']...)
+2025-12-19 16:19:20 - Backtest - INFO - 🔄 Processing 2024-10-31 | Capital: $131,798
+2025-12-19 16:19:27 - Backtest - INFO -    ✅ Position: 4 stocks (Top: ['CALM', 'BRK-B', 'CSW']...)
+2025-12-19 16:19:27 - Backtest - INFO - 🔄 Processing 2024-11-29 | Capital: $148,073
+2025-12-19 16:19:34 - Backtest - INFO -    ✅ Position: 5 stocks (Top: ['CNK', 'EAT', 'VST']...)
+2025-12-19 16:19:34 - Backtest - INFO - 🔄 Processing 2024-12-31 | Capital: $136,421
+2025-12-19 16:19:41 - Backtest - INFO -    ✅ Position: 7 stocks (Top: ['EAT', 'CNK', 'GDDY']...)
+2025-12-19 16:19:41 - Backtest - INFO - 🔄 Processing 2025-01-31 | Capital: $153,381
+2025-12-19 16:19:49 - Backtest - INFO -    ✅ Position: 7 stocks (Top: ['EAT', 'GDDY', 'CNK']...)
+2025-12-19 16:19:49 - Backtest - INFO - 🔄 Processing 2025-02-28 | Capital: $134,681
+2025-12-19 16:19:56 - Backtest - INFO -    ✅ Position: 7 stocks (Top: ['FOX', 'EAT', 'FOXA']...)
+2025-12-19 16:19:56 - Backtest - INFO - 🔄 Processing 2025-03-31 | Capital: $126,034
+2025-12-19 16:20:04 - Backtest - INFO -    ✅ Position: 4 stocks (Top: ['EAT', 'ADMA', 'APP']...)
+2025-12-19 16:20:04 - Backtest - INFO - 🔄 Processing 2025-04-30 | Capital: $130,885
+2025-12-19 16:20:12 - Backtest - INFO -    ✅ Position: 3 stocks (Top: ['EAT', 'CALM', 'APP']...)
+2025-12-19 16:20:12 - Backtest - INFO - 🔄 Processing 2025-05-30 | Capital: $161,539
+2025-12-19 16:20:19 - Backtest - INFO -    ✅ Position: 4 stocks (Top: ['EAT', 'CALM', 'APP']...)
+2025-12-19 16:20:19 - Backtest - INFO - 🔄 Processing 2025-06-30 | Capital: $160,382
+2025-12-19 16:20:28 - Backtest - INFO -    ✅ Position: 4 stocks (Top: ['EAT', 'CALM', 'APP']...)
+2025-12-19 16:20:28 - Backtest - INFO - 🔄 Processing 2025-07-31 | Capital: $164,189
+2025-12-19 16:20:36 - Backtest - INFO -    ✅ Position: 4 stocks (Top: ['EAT', 'CALM', 'AAMI']...)
+2025-12-19 16:20:36 - Backtest - INFO - 🔄 Processing 2025-08-29 | Capital: $182,435
+2025-12-19 16:20:44 - Backtest - INFO -    ✅ Position: 4 stocks (Top: ['AAMI', 'CALM', 'EAT']...)
+2025-12-19 16:20:44 - Backtest - INFO - 🔄 Processing 2025-09-30 | Capital: $180,750
+2025-12-19 16:20:53 - Backtest - INFO -    ✅ Position: 3 stocks (Top: ['IDCC', 'APP', 'CALM']...)
+2025-12-19 16:20:53 - Backtest - INFO - 🔄 Processing 2025-10-31 | Capital: $176,913
+2025-12-19 16:21:02 - Backtest - INFO -    ✅ Position: 3 stocks (Top: ['IDCC', 'APP', 'RUN']...)
+2025-12-19 16:21:02 - Backtest - INFO - 🔄 Processing 2025-11-28 | Capital: $171,990
+2025-12-19 16:21:11 - Backtest - INFO -    ✅ Position: 5 stocks (Top: ['APP', 'LNC', 'RUN']...)
+2025-12-19 16:21:11 - Backtest - WARNING - Benchmark (SPY) data missing. Skipping benchmark comparison.
+
+📈 Backtest Performance Summary:
+Initial Capital: $100,000
+Final Value:     $194,398.33
+Strategy Return: 94.40%
+Benchmark Return:0.00%
+🚀 RESULT: OUTPERFORMED THE MARKET!

@@ -91,7 +91,7 @@ def run_backtest_mode(report):
     report.add_heading("Historical Backtest Results")
     
     # 设定回测起点
-    backtester = BacktestEngine(start_date='2023-01-01', initial_capital=100000)
+    backtester = BacktestEngine(start_date='2021-01-01', initial_capital=100000)
     results = backtester.run()
     
     if results.empty:

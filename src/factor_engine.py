@@ -133,9 +133,27 @@ class FactorEngine:
         if prices_df.empty:
             return pd.DataFrame()
             
-        # 计算日收益率 (过滤极端值)
-        # 1. 过滤掉 > 100% (2.0) 和 < -50% (-0.5) 的单日涨跌幅 (可能是数据错误或极端情况)
-        returns_df = prices_df.pct_change().clip(lower=-0.5, upper=1.0).dropna(how='all')
+        # 计算日收益率 (过滤极端值 - 使用 Winsorization)
+        # 1. 计算 1% 和 99% 分位数 (针对整个截面或时间序列，这里简单对整个 DataFrame 做处理)
+        # 注意：每一列是一只股票，我们在时间维度上并没有太大意义做 winsorize，
+        # 但这里是全量数据的预处理。更精细的做法是每天做截面 winsorize
+        # 这里为了效率，先计算 returns
+        returns_df = prices_df.pct_change()
+        
+        # 2. 截面 Winsorization (按天)
+        # 对于每天的数据，将超过 1% / 99% 的值压缩到边界
+        # 这是一个 Pandas 这种 apply 操作可能会慢，但比循环快
+        def winsorize_series(s, lower=0.01, upper=0.99):
+            if s.empty: return s
+            q_low = s.quantile(lower)
+            q_high = s.quantile(upper)
+            return s.clip(lower=q_low, upper=q_high)
+
+        # Apply winsorization row-by-row (axis=1) -> Cross-sectional
+        returns_df = returns_df.apply(winsorize_series, axis=1)
+        
+        # 3. 再次过滤掉无效行
+        returns_df = returns_df.dropna(how='all')
         
         results = []
         

@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 import logging
+import yfinance as yf
 from src.data_manager import DataManager
 
 logger = logging.getLogger("FactorBuilder")
@@ -8,6 +9,25 @@ logger = logging.getLogger("FactorBuilder")
 class FactorBuilder:
     def __init__(self):
         self.db = DataManager()
+        
+    def _fetch_risk_free_rate(self, start_date=None, end_date=None):
+        """获取动态无风险利率 (^IRX)"""
+        try:
+            # 下载 13-week Treasury Bill
+            irx = yf.download("^IRX", start=start_date, end=end_date, progress=False, auto_adjust=True)
+            if irx.empty: return pd.Series()
+            
+            # yfinance 返回的是百分比 (e.g. 4.5 -> 4.5%)
+            # 转为日度小数: (4.5 / 100) / 252
+            close_rates = irx['Close']
+            if isinstance(close_rates, pd.DataFrame):
+                close_rates = close_rates.squeeze()
+            
+            rf_daily = (close_rates / 100) / 252
+            return rf_daily
+        except Exception as e:
+            logger.error(f"Failed to fetch RF: {e}")
+            return pd.Series()
         
     def get_full_universe_data(self, start_date=None):
         """
@@ -72,9 +92,27 @@ class FactorBuilder:
         
         # [FF5] 投资因子 (Asset Growth = d(Assets) / Assets)
         # 使用 252 交易日同比
+        # [FF5] 投资因子 (Asset Growth = d(Assets) / Assets)
+        # 使用 252 交易日同比
         asset_growth_pivot = asset_pivot.pct_change(periods=252)
         
-        return ret_pivot, mcap_pivot, bm_pivot, op_prof_pivot, asset_growth_pivot
+        # [FF6] 动量因子 (Momentum = Return (t-12 -> t-1))
+        # 逻辑：过去12个月的累计收益，剔除最近1个月 (252 - 21 = 231天窗口，滞后21天)
+        # P(t-21) / P(t-252) - 1
+        p_lag1 = price_pivot.shift(21)
+        p_lag12 = price_pivot.shift(252)
+        p_lag1 = price_pivot.shift(21)
+        p_lag12 = price_pivot.shift(252)
+        mom_pivot = (p_lag1 / p_lag12) - 1.0
+
+        # [FF6 Update] Fetch Dynamic RF
+        start_dt = price_pivot.index[0]
+        end_dt = price_pivot.index[-1]
+        rf_daily = self._fetch_risk_free_rate(start_dt, end_dt)
+        # Reindex to match universe dates (ffill for holidays)
+        rf_daily = rf_daily.reindex(price_pivot.index).ffill().fillna(0.04/252)
+
+        return ret_pivot, mcap_pivot, bm_pivot, op_prof_pivot, asset_growth_pivot, mom_pivot, rf_daily
 
     def build_factors(self, start_date='2018-01-01'):
         """
@@ -86,7 +124,10 @@ class FactorBuilder:
         if isinstance(data, pd.DataFrame) and data.empty:
             return pd.DataFrame()
             
-        ret, mcap, bm, op_prof, inv = data
+        if isinstance(data, pd.DataFrame) and data.empty:
+            return pd.DataFrame()
+            
+        ret, mcap, bm, op_prof, inv, mom, rf_series = data
         
         factors = []
         
@@ -137,8 +178,10 @@ class FactorBuilder:
                 continue
 
             # 4. 构建组合 (Sorting)
-            valid = pd.concat([mc, b, op, iv], axis=1, join='inner')
-            valid.columns = ['mcap', 'bm', 'op_prof', 'inv']
+            # 我们需要把所有 signal 拼在一起，注意：如果有任何一个因子确实，该股票就会被 drop
+            # 对于 FF6，如果缺少 Mom 数据，也会被剔除。这是标准做法。
+            valid = pd.concat([mc, b, op, iv, mom.loc[formation_date]], axis=1, join='inner')
+            valid.columns = ['mcap', 'bm', 'op_prof', 'inv', 'mom']
             valid.dropna(inplace=True)
             
             if len(valid) < 10: continue
@@ -163,10 +206,17 @@ class FactorBuilder:
             weak_mask = valid['op_prof'] <= p30_op
             
             # Inv Split
+            # Inv Split
             p30_inv = valid['inv'].quantile(0.3)
             p70_inv = valid['inv'].quantile(0.7)
             consv_mask = valid['inv'] <= p30_inv
             aggr_mask = valid['inv'] >= p70_inv
+            
+            # Mom Split
+            p30_mom = valid['mom'].quantile(0.3)
+            p70_mom = valid['mom'].quantile(0.7)
+            high_mom_mask = valid['mom'] >= p70_mom
+            low_mom_mask = valid['mom'] <= p30_mom
             
             # 5. 计算当月每一天的因子收益
             # 注意：在这个月内，Constituents 不变，Weight (shares) 也不变
@@ -199,15 +249,37 @@ class FactorBuilder:
             r_con = calc_ret(curr_month_ret, w[consv_mask])
             r_agg = calc_ret(curr_month_ret, w[aggr_mask])
             cma = r_con - r_agg
+
+            # Factor 6: MOM (Up - Down)
+            # Sm-Hi, Sm-Lo, Big-Hi, Big-Lo
+            # MOM = (Small-High + Big-High)/2 - (Small-Low + Big-Low)/2
+            # 注意：MOM 也是控制了 Size 的
+            
+            # Intersection masks
+            sh_mask = small_mask & high_mom_mask
+            sl_mask = small_mask & low_mom_mask
+            bh_mask = big_mask & high_mom_mask
+            bl_mask = big_mask & low_mom_mask
+            
+            r_sh = calc_ret(curr_month_ret, w[sh_mask])
+            r_sl = calc_ret(curr_month_ret, w[sl_mask])
+            r_bh = calc_ret(curr_month_ret, w[bh_mask])
+            r_bl = calc_ret(curr_month_ret, w[bl_mask])
+            
+            mom_factor = (r_sh + r_bh) / 2 - (r_sl + r_bl) / 2
             
             # 组合 DataFrame
+            # 获取当月每一天的 RF 值
+            curr_rf = rf_series.reindex(curr_month_ret.index).fillna(0.04/252)
+            
             month_df = pd.DataFrame({
-                'Mkt-RF': mkt - (0.04/252),
+                'Mkt-RF': mkt - curr_rf,
                 'SMB': smb,
                 'HML': hml,
                 'RMW': rmw,
                 'CMA': cma,
-                'RF': (0.04/252)
+                'MOM': mom_factor,
+                'RF': curr_rf
             })
             
             factors.append(month_df)

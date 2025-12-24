@@ -91,8 +91,11 @@ IB_CLIENT_ID = int(os.getenv("IB_CLIENT_ID", 1))
 # ==========================================
 # 设置每次下载的股票数量上限 (测试用)
 # ⚠️ 注意：正式全量运行时，请将这两个值设为 None
-SP500_LIMIT = 50   # 测试模式：只下 50 只
-SP600_LIMIT = 50   # 测试模式：只下 50 只
+SP500_LIMIT = None   # 测试模式：只下 50 只
+SP600_LIMIT = None   # 测试模式：只下 50 只
+
+# Fama-French Data Cache
+FF_CACHE_PATH = DATA_DIR / "ff_factors.csv"
 
 if __name__ == "__main__":
     # 测试代码：直接运行 python src/config.py 可以检查配置是否正确

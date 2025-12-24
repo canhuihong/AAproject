@@ -5,6 +5,12 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
+# 强制 UTF-8 输出，防止 emoji 报错
+if sys.stdout.encoding.lower() != 'utf-8':
+    sys.stdout.reconfigure(encoding='utf-8')
+if sys.stderr.encoding.lower() != 'utf-8':
+    sys.stderr.reconfigure(encoding='utf-8')
+
 # 引入我们刚才写好的 Reporting 模块
 from src.reporting import ReportManager
 from src.factor_engine import FactorEngine
@@ -91,7 +97,7 @@ def run_backtest_mode(report):
     report.add_heading("Historical Backtest Results")
     
     # 设定回测起点
-    backtester = BacktestEngine(start_date='2021-01-01', initial_capital=100000)
+    backtester = BacktestEngine(start_date='2023-01-01', initial_capital=100000)
     results = backtester.run()
     
     if results.empty:

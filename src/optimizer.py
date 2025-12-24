@@ -107,7 +107,8 @@ class PortfolioOptimizer:
         
         # 2. 定义优化问题
         constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
-        bounds = tuple((0.0, 1.0) for _ in range(num_assets))
+        # [Risk Control] 限制单只股票最大仓位 10%
+        bounds = tuple((0.0, 0.10) for _ in range(num_assets))
         
         def neg_sharpe(weights):
             try:

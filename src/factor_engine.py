@@ -25,10 +25,12 @@ class FactorEngine:
              df = pd.read_csv(FF_CACHE_PATH, index_col=0, parse_dates=True)
              # 简单的过期检查：如果最近一天太久远，就重算 (可选)
              if (pd.Timestamp.now() - df.index[-1]).days < 5:
-                # df = df[~df.index.duplicated(keep='first')] 
-                # 这里不需要重复检查了，builder生成的肯定是干净的，但保留也可
-                logger.info(f"📂 Loaded FF Factors from cache ({len(df)} rows)")
-                return df
+                # [FF6 Update] Check if MOM exists
+                if 'MOM' not in df.columns:
+                     logger.info("⚠️ Cached factors missing 'MOM'. Rebuilding...")
+                else:
+                     logger.info(f"📂 Loaded FF Factors from cache ({len(df)} rows)")
+                     return df
                  
         # 现场构建
         builder = FactorBuilder()
@@ -86,7 +88,9 @@ class FactorEngine:
         # 兼容性检查：如果新因子存在则加入回归
         factors = ['Mkt-RF', 'SMB', 'HML']
         if 'RMW' in data.columns: factors.append('RMW')
+        if 'RMW' in data.columns: factors.append('RMW')
         if 'CMA' in data.columns: factors.append('CMA')
+        if 'MOM' in data.columns: factors.append('MOM')
         
         X = data[factors]
         X = sm.add_constant(X)
@@ -185,7 +189,10 @@ class FactorEngine:
                     beta_smb = model.params.get('SMB', 0)
                     beta_hml = model.params.get('HML', 0)
                     beta_rmw = model.params.get('RMW', 0) # [FF5]
+                    beta_rmw = model.params.get('RMW', 0) # [FF5]
                     beta_cma = model.params.get('CMA', 0) # [FF5]
+                    beta_mom = model.params.get('MOM', 0) # [FF6]
+                    r_squared = model.rsquared
                     r_squared = model.rsquared
                     
                     results.append({
@@ -197,6 +204,7 @@ class FactorEngine:
                         'beta_hml': beta_hml,
                         'beta_rmw': beta_rmw,
                         'beta_cma': beta_cma,
+                        'beta_mom': beta_mom,
                         'r2': r_squared
                     })
                     valid_count += 1

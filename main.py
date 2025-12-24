@@ -37,28 +37,30 @@ def run_live_mode(report):
     report.add_heading("Live Portfolio Recommendation")
     report.add_text("Based on the latest available market and fundamental data.")
     
-    engine = FactorEngine()
     # 动态获取昨天的日期作为分析日（确保有收盘价）
-    yesterday = (datetime.datetime.now() - datetime.timedelta(days=1)).strftime('%Y-%m-%d')
-    scored_df = engine.get_scored_universe(analysis_date=yesterday)
+    analysis_date = (datetime.datetime.now() - datetime.timedelta(days=1)).strftime('%Y-%m-%d')
+
+    # 2. 选股 (FF5+Mom Alpha Model)
+    engine = FactorEngine()
+    df_scored = engine.get_scored_universe(analysis_date=analysis_date, top_n=100)
     
-    if scored_df.empty:
+    if df_scored.empty:
         msg = "❌ No data found for scoring. Please run init_data.py first."
         print(msg)
         report.add_text(msg)
         return
 
     # 选 Top 10
-    top_picks = scored_df.head(10)
-    top_tickers = top_picks.index.tolist()
+    top_picks = df_scored.head(10)
     
     # 1. 保存打分结果
-    report.save_data(scored_df, "factor_scores_latest.csv")
+    report.save_data(df_scored, "factor_scores_latest.csv")
     report.add_dataframe(top_picks.reset_index(), "Top 10 Scored Stocks (Raw)", max_rows=10)
 
-    # 优化权重
-    print(f"⚙️  Optimizing allocation for {yesterday}...")
-    optimizer = PortfolioOptimizer(top_tickers, analysis_date=yesterday)
+    # 3. 组合优化 (Maximize Sharpe)
+    top_tickers = df_scored.head(100).index.tolist()
+    print(f"⚙️  Optimizing allocation for {analysis_date}...")
+    optimizer = PortfolioOptimizer(top_tickers, analysis_date)
     allocation_df = optimizer.optimize_sharpe_ratio()
     
     if allocation_df.empty:
@@ -97,7 +99,7 @@ def run_backtest_mode(report):
     report.add_heading("Historical Backtest Results")
     
     # 设定回测起点
-    backtester = BacktestEngine(start_date='2023-01-01', initial_capital=100000)
+    backtester = BacktestEngine(start_date='2023-06-01', initial_capital=100000)
     results = backtester.run()
     
     if results.empty:

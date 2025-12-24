@@ -1,8 +1,10 @@
 import pandas as pd
 import numpy as np
 import logging
+import pandas_datareader.data as web
+import statsmodels.api as sm
 from src.data_manager import DataManager
-from src.config import FULL_BLOCKLIST
+from src.config import FULL_BLOCKLIST, FF_CACHE_PATH, PROXY_URL, DATA_DIR
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("FactorEngine")
@@ -10,104 +12,193 @@ logger = logging.getLogger("FactorEngine")
 class FactorEngine:
     def __init__(self):
         self.db = DataManager()
+        self.ff_factors = None
         
-    def get_price_history(self, end_date):
-        """获取用于计算动量的历史价格"""
+    def fetch_ff_factors(self):
+        """
+        获取 Fama-French 3因子数据 (自建版)
+        """
+        from src.factor_builder import FactorBuilder
+        
+        # 也可以加缓存逻辑
+        if FF_CACHE_PATH.exists():
+             df = pd.read_csv(FF_CACHE_PATH, index_col=0, parse_dates=True)
+             # 简单的过期检查：如果最近一天太久远，就重算 (可选)
+             if (pd.Timestamp.now() - df.index[-1]).days < 5:
+                # df = df[~df.index.duplicated(keep='first')] 
+                # 这里不需要重复检查了，builder生成的肯定是干净的，但保留也可
+                logger.info(f"📂 Loaded FF Factors from cache ({len(df)} rows)")
+                return df
+                 
+        # 现场构建
+        builder = FactorBuilder()
+        df = builder.build_factors(start_date='2018-01-01')
+        
+        if not df.empty:
+            df.to_csv(FF_CACHE_PATH)
+            
+        return df
+
+    def get_price_history_all(self, end_date):
+        """一次性获取所有股票的历史价格 (优化版)"""
+        # 为了保证有足够的窗口做回归，我们取 2 年的数据 (approx 504 trading days)
+        start_date = (pd.Timestamp(end_date) - pd.Timedelta(days=730)).strftime('%Y-%m-%d')
+        
         conn = self.db._get_conn()
         try:
-            # 优化：只取需要的列
-            query = f"SELECT date, ticker, close FROM prices WHERE date <= '{end_date}'"
+            # 只取需要的字段，且只取还在截面里的股票？这里为了简单，取全量
+            query = f"SELECT date, ticker, close FROM prices WHERE date >= '{start_date}' AND date <= '{end_date}'"
             df = pd.read_sql(query, conn)
+            df['date'] = pd.to_datetime(df['date'])
+            # 这里的 pivot 可能会消耗内存，但对几百只股票还好
+            return df.pivot(index='date', columns='ticker', values='close')
         except Exception as e:
             logger.error(f"Error reading prices: {e}")
             return pd.DataFrame()
         finally:
             conn.close()
-        
-        if df.empty: return df
-        df['date'] = pd.to_datetime(df['date'])
-        return df.sort_values(['ticker', 'date'])
 
-    def calculate_momentum(self, analysis_date, lookback_days=252):
-        """计算动量因子 (12个月)"""
-        df = self.get_price_history(analysis_date)
-        if df.empty: return pd.Series(dtype=float)
-
-        def get_mom(x):
-            # 至少要有半年数据才算动量
-            if len(x) < 120: return np.nan
-            
-            # 取一年前的价格，如果不够一年就取最早的
-            start_price = x.iloc[-lookback_days] if len(x) >= lookback_days else x.iloc[0]
-            end_price = x.iloc[-1]
-            
-            if start_price <= 0: return np.nan
-            return (end_price / start_price) - 1
-
-        return df.groupby('ticker')['close'].apply(get_mom).rename("factor_mom_raw")
-
-    def get_scored_universe(self, analysis_date=None):
+    def calculate_alpha(self, stock_returns, ff_data, min_obs=126):
         """
-        核心打分逻辑
+        核心回归逻辑
+        Rx - Rf = Alpha + b1*(Rm-Rf) + b2*SMB + b3*HML + epsilon
+        """
+        # 1. 索引对齐 (Inner Join)
+        if not stock_returns.index.is_unique:
+            stock_returns = stock_returns[~stock_returns.index.duplicated(keep='first')]
+        if not ff_data.index.is_unique:
+            ff_data = ff_data[~ff_data.index.duplicated(keep='first')]
+            
+        # 防止 Ticker 名字与因子名字 (如 RF) 冲突
+        stock_returns.name = "StockRet"
+            
+        # axis=1 join，自动对其日期
+        data = pd.concat([stock_returns, ff_data], axis=1, join='inner').dropna()
+        
+        if len(data) < min_obs:
+            return -np.inf, None  # 数据太少，直接置为负无穷
+        
+        # 2. 准备 Y 和 X
+        # Y: 股票超额收益 (Ri - Rf)
+        Y = data['StockRet'] - data['RF']
+        
+        # X: 因子 (Mkt-RF, SMB, HML, RMW, CMA)
+        # 兼容性检查：如果新因子存在则加入回归
+        factors = ['Mkt-RF', 'SMB', 'HML']
+        if 'RMW' in data.columns: factors.append('RMW')
+        if 'CMA' in data.columns: factors.append('CMA')
+        
+        X = data[factors]
+        X = sm.add_constant(X)
+        
+        try:
+            model = sm.OLS(Y, X).fit()
+            alpha = model.params['const']
+            
+            # 年化 Alpha (252天)
+            # 我们通常比较 年化Alpha，更直观
+            alpha_annual = (1 + alpha) ** 252 - 1
+            
+            # 也可以返回 t-stat 看显著性
+            # t_alpha = model.tvalues['const']
+            
+            return alpha_annual, model
+        except Exception:
+            return -np.inf, None
+
+    def get_scored_universe(self, analysis_date=None, top_n=10):
+        """
+        主流程: 
+        1. 获取 FF 因子
+        2. 获取所有股票价格 -> 算日收益率
+        3. 循环跑回归 -> 算出 Alpha
+        4. 排序返回
         """
         if not analysis_date:
             analysis_date = (pd.Timestamp.now() - pd.Timedelta(days=1)).strftime('%Y-%m-%d')
-
-        # 1. 获取截面原始数据 (新版：包含 net_income 等)
-        df_raw = self.db.get_cross_section_data(analysis_date)
-        if df_raw.empty: return pd.DataFrame()
-        
-        df_raw.set_index('ticker', inplace=True)
-        
-        # 数据类型清洗
-        cols = ['close', 'net_income', 'total_equity', 'shares_count']
-        for c in cols:
-            df_raw[c] = pd.to_numeric(df_raw[c], errors='coerce')
-        
-        # 2. 现场计算因子 (On-the-fly Calculation)
-        # 市值
-        df_raw['market_cap'] = df_raw['close'] * df_raw['shares_count']
-        
-        # 估值 (PE倒数) = Net Income / Market Cap
-        # 简单年化：季度利润 * 4
-        df_raw['net_income_annual'] = df_raw['net_income'] * 4
-        
-        # 过滤亏损股和资不抵债股
-        df_raw = df_raw[df_raw['net_income_annual'] > 0]
-        df_raw = df_raw[df_raw['total_equity'] > 0]
-        
-        # 计算具体指标
-        df_raw['pe_ratio'] = df_raw['market_cap'] / df_raw['net_income_annual']
-        df_raw['factor_value'] = 1.0 / df_raw['pe_ratio']  # E/P
-        df_raw['factor_quality'] = df_raw['net_income_annual'] / df_raw['total_equity'] # ROE
-        
-        # 3. 合并动量
-        mom_series = self.calculate_momentum(analysis_date)
-        df = df_raw.join(mom_series)
-        
-        # 4. 黑名单过滤与去极值
-        df = df[~df.index.isin(FULL_BLOCKLIST)]
-        df.replace([np.inf, -np.inf], np.nan, inplace=True)
-        df.dropna(subset=['factor_value', 'factor_quality', 'factor_mom_raw'], inplace=True)
-        
-        if df.empty: return pd.DataFrame()
-
-        # 5. 标准化打分 (Z-Score)
-        factors = ['factor_value', 'factor_quality', 'factor_mom_raw']
-        for f in factors:
-            mean = df[f].mean()
-            std = df[f].std()
-            # 避免除以0
-            if std == 0: std = 1
             
-            # 简单的 Z-Score
-            df[f+'_z'] = (df[f] - mean) / std
+        logger.info(f"⚙️  Starting FF Alpha selection (FF5 Model) for {analysis_date}...")
+
+        # 1. 准备因子
+        ff_factors = self.fetch_ff_factors()
+        if ff_factors.empty:
+            logger.error("FF factors unavailable. Implementation Aborted.")
+            return pd.DataFrame()
             
-        # 6. 综合得分
-        df['final_score'] = (
-            0.4 * df['factor_value_z'] +
-            0.3 * df['factor_quality_z'] +
-            0.3 * df['factor_mom_raw_z']
-        )
+        # 截取到分析日
+        ff_factors = ff_factors[ff_factors.index <= analysis_date]
+
+        # 2. 准备股票收益率
+        prices_df = self.get_price_history_all(analysis_date)
+        if prices_df.empty:
+            return pd.DataFrame()
+            
+        # 计算日收益率 (过滤极端值)
+        # 1. 过滤掉 > 100% (2.0) 和 < -50% (-0.5) 的单日涨跌幅 (可能是数据错误或极端情况)
+        returns_df = prices_df.pct_change().clip(lower=-0.5, upper=1.0).dropna(how='all')
         
-        return df.sort_values('final_score', ascending=False)
+        results = []
+        
+        # 3. 逐个回归 (这里可以优化用 GroupBy Apply 或者矩阵运算，但循环更直观)
+        tickers = returns_df.columns
+        total = len(tickers)
+        
+        # 可以在生产环境加 tqdm，这里为了日志清爽简单打 print
+        from tqdm import tqdm
+        
+        valid_count = 0
+        for ticker in tqdm(tickers, desc="Regressing"):
+            if ticker in FULL_BLOCKLIST: continue
+            
+            series = returns_df[ticker].dropna()
+            if series.empty: continue
+            
+            try:
+                # 提高最小观测数据量到 126 (半年)
+                alpha, model = self.calculate_alpha(series, ff_factors, min_obs=126)
+                
+                # 过滤条件
+                # 1. alpha > -1.0 (非负无穷)
+                # 2. alpha < 5.0 (年化 500% 以上通常是伪回归)
+                if alpha > -1.0 and alpha < 5.0: 
+                    # 我们同时保存 Beta (作为参考)
+                    # 我们同时保存 Beta (作为参考)
+                    beta_mkt = model.params.get('Mkt-RF', 0)
+                    beta_smb = model.params.get('SMB', 0)
+                    beta_hml = model.params.get('HML', 0)
+                    beta_rmw = model.params.get('RMW', 0) # [FF5]
+                    beta_cma = model.params.get('CMA', 0) # [FF5]
+                    r_squared = model.rsquared
+                    
+                    results.append({
+                        'ticker': ticker,
+                        'final_score': alpha, # 将 Alpha 作为最终得分
+                        'alpha_annual': alpha,
+                        'beta_mkt': beta_mkt,
+                        'beta_smb': beta_smb,
+                        'beta_hml': beta_hml,
+                        'beta_rmw': beta_rmw,
+                        'beta_cma': beta_cma,
+                        'r2': r_squared
+                    })
+                    valid_count += 1
+            except Exception as e:
+                logger.warning(f"Skipping {ticker} due to error: {e}")
+                continue
+
+        if not results:
+            logger.warning("No valid regression results found.")
+            return pd.DataFrame()
+
+        # 4. 排序与输出
+        df_res = pd.DataFrame(results)
+        df_res.set_index('ticker', inplace=True)
+        
+        # 过滤掉 R2 太低的？(比如噪音太大，Alpha 不可信)
+        # 这里暂时不过滤，全凭 Alpha 说话
+        
+        df_res = df_res.sort_values('final_score', ascending=False)
+        
+        logger.info(f"✅ Regression completed for {valid_count} stocks. Top Alpha: {df_res.iloc[0]['alpha_annual']:.2%}")
+        
+        return df_res

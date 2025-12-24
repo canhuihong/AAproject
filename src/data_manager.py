@@ -15,7 +15,7 @@ class DataManager:
         return sqlite3.connect(self.db_path, check_same_thread=False)
 
     def _initialize_db(self):
-        """初始化数据库表结构 (Schema V2)"""
+        """初始化数据库表结构 (Schema V3)"""
         conn = self._get_conn()
         cursor = conn.cursor()
         
@@ -31,7 +31,6 @@ class DataManager:
         ''')
 
         # 2. 基本面表 (重大升级：存储原始财报数据)
-        # 即使代码短了，是因为我们不再存储计算好的 PE/PB，而是存原始数据
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS fundamentals (
             date TEXT,
@@ -41,10 +40,19 @@ class DataManager:
             total_revenue REAL,   -- 营收
             shares_count REAL,    -- 流通股本
             report_period TEXT,   -- 原始财报日期
+            total_assets REAL,    -- [FF5新增] 总资产 (用于 CMA)
+            operating_income REAL,-- [FF5新增] 营业利润 (用于 RMW)
             PRIMARY KEY (date, ticker)
         )
         ''')
         
+        # 简单迁移逻辑：尝试添加新列 (如果不小心是旧库)
+        try:
+            cursor.execute("ALTER TABLE fundamentals ADD COLUMN total_assets REAL")
+            cursor.execute("ALTER TABLE fundamentals ADD COLUMN operating_income REAL")
+        except:
+            pass # 已经存在或失败忽略
+
         conn.commit()
         conn.close()
 
@@ -64,14 +72,14 @@ class DataManager:
             conn.close()
 
     def save_fundamentals(self, records):
-        """批量保存基本面 (V2结构)"""
+        """批量保存基本面 (V3结构)"""
         if not records: return
         conn = self._get_conn()
         try:
             conn.executemany(
                 '''INSERT OR REPLACE INTO fundamentals 
-                   (date, ticker, net_income, total_equity, total_revenue, shares_count, report_period) 
-                   VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                   (date, ticker, net_income, total_equity, total_revenue, shares_count, report_period, total_assets, operating_income) 
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                 records
             )
             conn.commit()

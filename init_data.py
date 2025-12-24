@@ -2,17 +2,11 @@ import yfinance as yf
 import pandas as pd
 import datetime
 import time
+from tqdm import tqdm
 import logging
 import requests
 import os
 from io import StringIO
-
-# 进度条兼容性处理
-try:
-    from tqdm import tqdm
-except ImportError:
-    print("建议安装 tqdm: pip install tqdm")
-    def tqdm(iterable, desc=""): return iterable
 
 # 引入配置
 # 确保你的 src/config.py 里已经有了 SP500_LIMIT, SP600_LIMIT 这些定义
@@ -49,7 +43,7 @@ def get_tickers_from_wiki(url, name):
         if col_name not in df.columns:
             col_name = df.columns[0]
             
-        tickers = df[col_name].astype(str).str.replace('.', '-', regex=False).tolist()
+        tickers = df[col_name].astype(str).str.replace('.', '-', regex=False).str.replace('$', '', regex=False).str.strip().tolist()
         
         logger.info(f"✅ Successfully fetched {len(tickers)} tickers for {name}")
         return tickers
@@ -87,12 +81,25 @@ def process_single_stock(ticker, db, last_update_date=None, is_benchmark=False):
 
             # 增量更新
             next_day = last_dt + datetime.timedelta(days=1)
+            # 如果下一天就是今天，且还没收盘(简单判断)，可能取不到数据，建议跳过
+            if next_day.date() == today_dt.date():
+                 # 简单策略：如果还没过下午5点(美股收盘)，就不强求更新今天的数据
+                 if today_dt.hour < 17:
+                     return 0
+
             start_date = next_day.strftime('%Y-%m-%d')
             download_period = None 
+
+        # Santize ticker
+        original_ticker = ticker
+        ticker = ticker.replace('$', '').strip() 
+        if original_ticker != ticker:
+            logger.info(f"🔧 Sanitized ticker: {original_ticker} -> {ticker}")
 
         # ==========================================
         # B. 价格下载 (Price Data)
         # ==========================================
+        # logger.debug(f"Processing: {ticker}")
         obj = yf.Ticker(ticker)
         
         if start_date:
@@ -149,6 +156,16 @@ def process_single_stock(ticker, db, last_update_date=None, is_benchmark=False):
                         if k in bs_df.index:
                             eq = bs_df.loc[k, date]
                             break
+
+                    # [FF5新增] 总资产 (用于 CMA)
+                    assets = bs_df.loc['Total Assets', date] if 'Total Assets' in bs_df.index else 0
+                    
+                    # [FF5新增] 营业利润 (用于 RMW)
+                    op_inc = 0
+                    for k in ['Operating Income', 'Operating Profit', 'EBIT']:
+                        if k in fin_df.index:
+                            op_inc = fin_df.loc[k, date]
+                            break
                     
                     # 60天前视偏差防护 (Pit-in-Time Lag)
                     # 假设财报发布日 = 报告期 + 60天
@@ -159,7 +176,8 @@ def process_single_stock(ticker, db, last_update_date=None, is_benchmark=False):
                         eff_date.strftime('%Y-%m-%d'), # 数据可用日期 (用于回测)
                         ticker, 
                         float(ni), float(eq), float(rev), float(shares), 
-                        date.strftime('%Y-%m-%d')      # 原始报告期
+                        date.strftime('%Y-%m-%d'),      # 原始报告期
+                        float(assets), float(op_inc)    # [FF5新增]
                     ))
                 except Exception:
                     continue
@@ -186,6 +204,7 @@ def main():
     
     print("\n" + "="*60)
     print("🚀 QML Reborn: Robust Update Mode (Hybrid Fundamentals)")
+    print("📢 Version: With Ticker Sanitization Fix (No $)")
     print("="*60)
 
     # 1. 扫描现状

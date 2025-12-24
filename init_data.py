@@ -10,7 +10,7 @@ from io import StringIO
 
 # 引入配置
 # 确保你的 src/config.py 里已经有了 SP500_LIMIT, SP600_LIMIT 这些定义
-from src.config import DATA_DIR, ETF_BLOCKLIST, PROXY_URL, DB_PATH, SP500_LIMIT, SP600_LIMIT
+from src.config import DATA_DIR, ETF_BLOCKLIST, PROXY_URL, DB_PATH, SP500_LIMIT, SP600_LIMIT, SP400_LIMIT, NASDAQ_LIMIT
 from src.data_manager import DataManager
 
 # 详细的日志格式
@@ -43,7 +43,26 @@ def get_tickers_from_wiki(url, name):
         if col_name not in df.columns:
             col_name = df.columns[0]
             
-        tickers = df[col_name].astype(str).str.replace('.', '-', regex=False).str.replace('$', '', regex=False).str.strip().tolist()
+        raw_tickers = df[col_name].astype(str).tolist()
+        
+        cleaned_tickers = []
+        garbage_list = [
+            'CONSTITUENTS', 'EXCHANGES', 'SYMBOL', 'TICKER', 'SECURITY', 'COMPANY', 'GICS SECTOR', 
+            'FOUNDATION', 'OPERATOR', 'TYPE', 'WEBSITE'
+        ]
+        
+        for t in raw_tickers:
+            # 1. Basic Cleaning
+            t = t.replace('.', '-').replace('$', '').strip()
+            
+            # 2. Garbage Filter
+            if t.upper() in garbage_list: continue
+            if len(t) > 5 and not t.isalpha(): continue # Skip weird long strings
+            if not t: continue
+            
+            cleaned_tickers.append(t)
+            
+        tickers = cleaned_tickers
         
         logger.info(f"✅ Successfully fetched {len(tickers)} tickers for {name}")
         return tickers
@@ -101,6 +120,24 @@ def process_single_stock(ticker, db, last_update_date=None, is_benchmark=False):
         # ==========================================
         # logger.debug(f"Processing: {ticker}")
         obj = yf.Ticker(ticker)
+
+        # 【新增修复】 检查拆股 (Splits)
+        # 如果上次更新后发生了拆股，必须全量重下，否则价格不连续
+        if start_date:
+            try:
+                splits = obj.splits
+                if not splits.empty:
+                    # 找到最近一次拆股时间
+                    last_split_date = splits.index.max().to_pydatetime()
+                    last_db_date = datetime.datetime.strptime(last_update_date, '%Y-%m-%d')
+                    
+                    # 如果拆股发生在上次更新之后，或者就是同一天，强制重跑
+                    if last_split_date >= last_db_date:
+                        logger.info(f"🔄 Split detected for {ticker} on {last_split_date.date()}. Forcing full redownload.")
+                        start_date = None
+                        download_period = "10y"
+            except Exception:
+                pass # 获取拆股数据失败，安全起见按原计划跑 (或者也可以选择强制重跑，这里先保守)
         
         if start_date:
             hist = obj.history(start=start_date, auto_adjust=True)
@@ -232,8 +269,20 @@ def main():
     if SP600_LIMIT is not None:
         print(f"🚧 Test Mode: Limiting S&P 600 to first {SP600_LIMIT} stocks.")
         sp600 = sp600[:SP600_LIMIT]
+
+    # [新增] S&P 400 MidCap
+    sp400 = get_tickers_from_wiki("https://en.wikipedia.org/wiki/List_of_S%26P_400_companies", "S&P 400")
+    if SP400_LIMIT is not None:
+        print(f"🚧 Test Mode: Limiting S&P 400 to first {SP400_LIMIT} stocks.")
+        sp400 = sp400[:SP400_LIMIT]
+
+    # [新增] Nasdaq 100
+    nasdaq = get_tickers_from_wiki("https://en.wikipedia.org/wiki/Nasdaq-100", "Nasdaq 100")
+    if NASDAQ_LIMIT is not None:
+        print(f"🚧 Test Mode: Limiting Nasdaq 100 to first {NASDAQ_LIMIT} stocks.")
+        nasdaq = nasdaq[:NASDAQ_LIMIT]
     
-    full_list = sorted(list(set(sp500 + sp600)))
+    full_list = sorted(list(set(sp500 + sp600 + sp400 + nasdaq)))
     final_list = [t for t in full_list if t not in ETF_BLOCKLIST]
     
     print(f"\n🎯 Total Targets: {len(final_list)} stocks")

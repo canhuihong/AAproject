@@ -93,6 +93,8 @@ IB_CLIENT_ID = int(os.getenv("IB_CLIENT_ID", 1))
 # ⚠️ 注意：正式全量运行时，请将这两个值设为 None
 SP500_LIMIT = None   # 测试模式：只下 50 只
 SP600_LIMIT = None   # 测试模式：只下 50 只
+SP400_LIMIT = None   # 中盘股
+NASDAQ_LIMIT = None  # 科技股
 
 # Fama-French Data Cache
 FF_CACHE_PATH = DATA_DIR / "ff_factors.csv"
@@ -106,4 +108,6 @@ if __name__ == "__main__":
     print(f"🚫 Blocklist:    {len(FULL_BLOCKLIST)} items")
     print(f"🚧 SP500 Limit:  {SP500_LIMIT}")
     print(f"🚧 SP600 Limit:  {SP600_LIMIT}")
+    print(f"🚧 SP400 Limit:  {SP400_LIMIT}")
+    print(f"🚧 NASDAQ Limit: {NASDAQ_LIMIT}")
     print("-" * 30)

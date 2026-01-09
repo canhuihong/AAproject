@@ -42,7 +42,7 @@ PROXY_URL = f"http://127.0.0.1:{PROXY_PORT}"
 os.environ["HTTP_PROXY"] = PROXY_URL
 os.environ["HTTPS_PROXY"] = PROXY_URL
 
-print(f"🌐 System Proxy Configured: {PROXY_URL}")
+print(f"System Proxy Configured: {PROXY_URL}")
 
 # ==========================================
 # 4. 业务常量与黑名单 (Business Logic)

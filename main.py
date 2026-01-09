@@ -25,7 +25,7 @@ def calculate_max_drawdown(series):
 def run_live_mode(report):
     """实盘模式：基于最新数据推荐当前持仓"""
     print("\n" + "="*60)
-    print("📢 [PART 1] LIVE MARKET RECOMMENDATION")
+    print("[PART 1] LIVE MARKET RECOMMENDATION")
     print("="*60)
     
     report.add_heading("Live Portfolio Recommendation")
@@ -37,31 +37,31 @@ def run_live_mode(report):
     scored_df = engine.get_scored_universe(analysis_date=yesterday)
     
     if scored_df.empty:
-        msg = "❌ No data found for scoring. Please run init_data.py first."
+        msg = "No data found for scoring. Please run init_data.py first."
         print(msg)
         report.add_text(msg)
         return
 
-    # 选 Top 10
-    top_picks = scored_df.head(10)
+    # 选 Top 20 (Diversified)
+    top_picks = scored_df.head(20)
     top_tickers = top_picks.index.tolist()
     
     # 1. 保存打分结果
     report.save_data(scored_df, "factor_scores_latest.csv")
-    report.add_dataframe(top_picks.reset_index(), "Top 10 Scored Stocks (Raw)", max_rows=10)
+    report.add_dataframe(top_picks.reset_index(), "Top 20 Scored Stocks (Raw)", max_rows=20)
 
-    # 优化权重
-    print(f"⚙️  Optimizing allocation for {yesterday}...")
+    # 优化权重 (Max 10% per stock)
+    print(f"Optimizing allocation for {yesterday}...")
     optimizer = PortfolioOptimizer(top_tickers, analysis_date=yesterday)
-    allocation_df = optimizer.optimize_sharpe_ratio()
+    allocation_df = optimizer.optimize_sharpe_ratio(max_weight=0.1)
     
     if allocation_df.empty:
-        print("⚠️ Optimization failed.")
+        print("Optimization failed.")
         report.add_text("Optimization failed due to insufficient data history.")
         return
 
     # 2. 输出最终建议
-    print("\n🏆 Final Recommended Portfolio:")
+    print("\nFinal Recommended Portfolio:")
     final = allocation_df[allocation_df['weight'] > 0.001].copy()
     
     # 格式化输出到控制台
@@ -85,17 +85,17 @@ def run_live_mode(report):
 def run_backtest_mode(report):
     """回测模式"""
     print("\n\n" + "="*60)
-    print("⏳ [PART 2] HISTORICAL BACKTEST VERIFICATION")
+    print("[PART 2] HISTORICAL BACKTEST VERIFICATION")
     print("="*60)
     
     report.add_heading("Historical Backtest Results")
     
     # 设定回测起点
-    backtester = BacktestEngine(start_date='2023-01-01', initial_capital=100000)
+    backtester = BacktestEngine(start_date='2021-12-01', initial_capital=100000)
     results = backtester.run()
     
     if results.empty:
-        print("❌ Backtest failed.")
+        print("Backtest failed.")
         report.add_text("Backtest produced no trades/results.")
         return
         
@@ -119,7 +119,7 @@ def run_backtest_mode(report):
     mdd = calculate_max_drawdown(results['Strategy'])
     
     # 打印到控制台
-    print(f"\n📈 Performance Summary:")
+    print(f"\nPerformance Summary:")
     print(f"Total Return: {total_ret:.2%}")
     print(f"Annualized:   {ann_ret:.2%}")
     print(f"Sharpe Ratio: {sharpe:.2f}")
@@ -168,13 +168,13 @@ if __name__ == "__main__":
     # 初始化报告管理器
     report = ReportManager()
     
-    print(f"📂 Output Directory: {report.report_dir}")
+    print(f"Output Directory: {report.report_dir}")
     
     try:
         run_live_mode(report)
         run_backtest_mode(report)
     except Exception as e:
-        print(f"❌ An error occurred: {e}")
+        print(f"An error occurred: {e}")
         report.add_text(f"CRITICAL ERROR: {e}")
     finally:
         # 无论如何都要生成报告

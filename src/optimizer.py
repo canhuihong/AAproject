@@ -93,7 +93,7 @@ class PortfolioOptimizer:
         sharpe_ratio = (portfolio_return - self.rfr) / portfolio_volatility
         return portfolio_return, portfolio_volatility, sharpe_ratio
 
-    def optimize_sharpe_ratio(self):
+    def optimize_sharpe_ratio(self, max_weight=1.0):
         """
         核心方法：无论如何返回一个 DataFrame，绝不报错
         """
@@ -107,7 +107,7 @@ class PortfolioOptimizer:
         
         # 2. 定义优化问题
         constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
-        bounds = tuple((0.0, 1.0) for _ in range(num_assets))
+        bounds = tuple((0.0, max_weight) for _ in range(num_assets))
         
         def neg_sharpe(weights):
             try:

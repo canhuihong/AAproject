@@ -5,6 +5,7 @@ import time
 import logging
 import requests
 import os
+import random
 from io import StringIO
 
 # 进度条兼容性处理
@@ -21,8 +22,11 @@ from src.data_manager import DataManager
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("InitData")
 
+# Silencing yfinance noise
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+
 def get_tickers_from_wiki(url, name):
-    """【爬虫】从维基百科获取代码 (稳健版)"""
+    """【爬虫】从维基百科获取代码 (稳健版 - 自动寻找正确表格)"""
     logger.info(f"🌐 Crawling {name} from Wikipedia...")
     
     # 1. 设置完整的请求头 (伪装成浏览器)
@@ -43,12 +47,30 @@ def get_tickers_from_wiki(url, name):
         
         # 解析表格
         tables = pd.read_html(StringIO(response.text))
-        df = tables[0]
         
-        # 兼容不同的列名写法
-        col_name = 'Symbol' if 'Symbol' in df.columns else 'Ticker symbol'
-        if col_name not in df.columns:
-            col_name = df.columns[0] # 盲猜第一列
+        df = None
+        target_col = None
+        
+        # 自动寻找包含 Ticker 或 Symbol 的表格
+        candidates = ['Symbol', 'Ticker', 'Ticker symbol', 'Ticker Symbol']
+        
+        for table in tables:
+            # 检查列名
+            for candidate in candidates:
+                if candidate in table.columns:
+                    df = table
+                    target_col = candidate
+                    break
+            if df is not None:
+                break
+                
+        if df is None:
+            # 如果找不到，回退到第一个表格 (可能是旧逻辑)
+            logger.warning(f"⚠️ Could not find explicit Ticker column for {name}, trying first table...")
+            df = tables[0]
+            col_name = df.columns[0]
+        else:
+            col_name = target_col
             
         # 清洗代码 (把 BRK.B 转为 BRK-B 以适配 Yahoo)
         tickers = df[col_name].astype(str).str.replace('.', '-', regex=False).tolist()
@@ -88,6 +110,12 @@ def process_single_stock(ticker, db, last_update_date=None, is_benchmark=False):
 
             # 否则，设置增量下载的起始日期
             next_day = last_dt + datetime.timedelta(days=1)
+            
+            # 【CRITICAL FIX】防止请求当天的还没产生的数据
+            # 如果 next_day >= 今天，说明昨天的已经有了，今天的还没收盘 -> 跳过
+            if next_day.date() >= datetime.datetime.now().date():
+                return 0
+                
             start_date = next_day.strftime('%Y-%m-%d')
             download_period = None 
 
@@ -97,10 +125,24 @@ def process_single_stock(ticker, db, last_update_date=None, is_benchmark=False):
         obj = yf.Ticker(ticker)
         
         # 只有在确实需要下载时才联网
-        if start_date:
-            hist = obj.history(start=start_date, auto_adjust=True)
-        else:
-            hist = obj.history(period=download_period, auto_adjust=True)
+        hist = pd.DataFrame()
+        
+        # Retry Logic (3 Attempts)
+        for attempt in range(3):
+            try:
+                if start_date:
+                    hist = obj.history(start=start_date, auto_adjust=True)
+                else:
+                    hist = obj.history(period=download_period, auto_adjust=True)
+                
+                if not hist.empty:
+                    break
+                
+                # If empty, maybe rate limited? Wait a bit
+                time.sleep(2 * (attempt + 1))
+            except Exception as e:
+                logger.warning(f"⚠️ Retry {attempt+1}/3 failed for {ticker}: {e}")
+                time.sleep(3 * (attempt + 1))
             
         if not hist.empty:
             if hist.index.tz is not None:
@@ -119,50 +161,56 @@ def process_single_stock(ticker, db, last_update_date=None, is_benchmark=False):
         if start_date and hist.empty: return 1
 
         # ==========================================
-        # C. 财报下载 (Fundamentals)
+        # C. 财报下载 (Fundamentals) - MERGED MODE
         # ==========================================
-        # 使用 quarterly_financials 获取更灵敏的季度数据
-        fin = obj.quarterly_financials
-        bs = obj.quarterly_balance_sheet
-        
-        # 兜底：如果季度没数据，试下年度
-        if fin.empty: fin = obj.financials
-        if bs.empty: bs = obj.balance_sheet
-        
-        # 还没数据？那就算了
-        if fin.empty or bs.empty: return -1
-        
-        common_dates = fin.columns.intersection(bs.columns)
-        shares = obj.info.get('sharesOutstanding')
-        
-        if not shares or len(common_dates) == 0: return -1
+        def extract_fundamentals(fin_df, bs_df):
+            """Helper to extract common dates and metrics"""
+            if fin_df.empty or bs_df.empty: return []
+            
+            common = fin_df.columns.intersection(bs_df.columns)
+            recs = []
+            
+            # Fetch shares once
+            shares = obj.info.get('sharesOutstanding')
+            if not shares: return []
 
-        fund_recs = []
-        for date in common_dates:
-            try:
-                # 提取关键字段，使用 .get 避免 KeyError
-                ni = fin.loc['Net Income', date] if 'Net Income' in fin.index else 0
-                rev = fin.loc['Total Revenue', date] if 'Total Revenue' in fin.index else 0
-                
-                # 权益字段可能有变种
-                eq = 0
-                for k in ['Stockholders Equity', 'Total Stockholder Equity', 'Total Equity']:
-                    if k in bs.index:
-                        eq = bs.loc[k, date]
-                        break
-                
-                # 60天前视偏差防护
-                eff_date = date + datetime.timedelta(days=60)
-                if eff_date > datetime.datetime.now(): continue
-                
-                fund_recs.append((
-                    eff_date.strftime('%Y-%m-%d'), # 数据的可用日期
-                    ticker, 
-                    float(ni), float(eq), float(rev), float(shares), 
-                    date.strftime('%Y-%m-%d')      # 原始报告期
-                ))
-            except Exception:
-                continue
+            for date in common:
+                try:
+                    ni = fin_df.loc['Net Income', date] if 'Net Income' in fin_df.index else 0
+                    rev = fin_df.loc['Total Revenue', date] if 'Total Revenue' in fin_df.index else 0
+                    
+                    eq = 0
+                    for k in ['Stockholders Equity', 'Total Stockholder Equity', 'Total Equity']:
+                        if k in bs_df.index:
+                            eq = bs_df.loc[k, date]
+                            break
+                    
+                    # 60天前视偏差防护
+                    eff_date = date + datetime.timedelta(days=60)
+                    if eff_date > datetime.datetime.now(): continue
+                    
+                    recs.append((
+                        eff_date.strftime('%Y-%m-%d'), 
+                        ticker, 
+                        float(ni), float(eq), float(rev), float(shares), 
+                        date.strftime('%Y-%m-%d')
+                    ))
+                except Exception:
+                    continue
+            return recs
+
+        # 1. Get Both Sets
+        q_recs = extract_fundamentals(obj.quarterly_financials, obj.quarterly_balance_sheet)
+        a_recs = extract_fundamentals(obj.financials, obj.balance_sheet)
+        
+        # 2. Merge & Deduplicate (Prefer Quarterly if date conflict? Actually dates usually differ)
+        # Use a dict to dedup by report_date
+        combined = {}
+        for r in a_recs + q_recs:
+             # r[-1] is report_date
+             combined[r[-1]] = r
+             
+        fund_recs = list(combined.values())
             
         if fund_recs:
             db.save_fundamentals(fund_recs)
@@ -199,8 +247,10 @@ def main():
     # 3. 抓取正股名单
     sp500 = get_tickers_from_wiki("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", "S&P 500")
     sp600 = get_tickers_from_wiki("https://en.wikipedia.org/wiki/List_of_S%26P_600_companies", "S&P 600")
+    sp400 = get_tickers_from_wiki("https://en.wikipedia.org/wiki/List_of_S%26P_400_companies", "S&P 400") # MidCap
+    nasdaq100 = get_tickers_from_wiki("https://en.wikipedia.org/wiki/Nasdaq-100", "NASDAQ 100")
     
-    full_list = sorted(list(set(sp500 + sp600)))
+    full_list = sorted(list(set(sp500 + sp600 + sp400 + nasdaq100)))
     final_list = [t for t in full_list if t not in ETF_BLOCKLIST]
     
     print(f"\n🎯 Total Targets: {len(final_list)} stocks")
@@ -225,10 +275,10 @@ def main():
         # 【恢复】简单的限流逻辑，防止 Yahoo 封禁
         # 只有在发生真实网络请求(Upd)时才 sleep，Skip 时不 sleep
         if status == 1:
-            time.sleep(0.05) 
-            # 每 100 个请求歇口气
-            if counts['Upd'] % 100 == 0:
-                time.sleep(0.5)
+            time.sleep(random.uniform(0.3, 0.7)) 
+            # 每 50 个请求多歇会
+            if counts['Upd'] % 50 == 0:
+                time.sleep(2.0)
 
     print("\n" + "="*60)
     print("✅ PROCESS COMPLETED!")

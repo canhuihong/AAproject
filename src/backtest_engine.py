@@ -109,17 +109,23 @@ class BacktestEngine:
 
             if scored_df.empty:
                 logger.warning(f"   ⚠️ No stocks selected. Holding Cash.")
-                # 持币不动
+                # If we haven't started trading yet, don't accumulate "flat line"
+                # Just skip this date basically moving the start_date forward
+                if len(full_curve) == 0:
+                    logger.info("   ⏳ Waiting for data to warm up... Skipping period.")
+                    continue
+                    
+                # Otherwise, hold cash
                 dates = pd.date_range(curr_date, next_date)
                 full_curve.append(pd.Series(current_capital, index=dates))
                 continue
                 
-            top_tickers = scored_df.head(10).index.tolist()
+            top_tickers = scored_df.head(20).index.tolist()
             
-            # --- 2. 优化权重 ---
+            # --- 2. 优化权重 (Max 10%) ---
             try:
                 optimizer = PortfolioOptimizer(top_tickers, analysis_date=date_str)
-                allocation_df = optimizer.optimize_sharpe_ratio()
+                allocation_df = optimizer.optimize_sharpe_ratio(max_weight=0.1)
             except Exception as e:
                 logger.warning(f"   ⚠️ Optimizer crashed: {e}")
                 allocation_df = pd.DataFrame()
@@ -200,15 +206,25 @@ class BacktestEngine:
             spy_data = self._get_period_price_data(['SPY'], rebalance_dates[0], rebalance_dates[-1])
             if not spy_data.empty and 'SPY' in spy_data.columns:
                 # 计算 SPY 净值
+                # 关键修复：基准必须和策略在同一天归一化 (Rebase)
+                # 否则如果策略从 2024 年才开始 (前面跳过了)，基准却从 2023 年开始算，起点就不一样了
                 spy_series = spy_data['SPY']
-                spy_curve = (spy_series / spy_series.iloc[0]) * self.initial_capital
                 
-                # 关键修复：使用左连接 (join)，以策略的时间轴为准
-                # 这样即使 SPY 有缺数据，也不会把策略的数据删掉
-                result_df = result_df.join(spy_curve.rename('Benchmark (SPY)'), how='left')
+                # 找到策略真正的起始日期
+                strategy_start_date = result_df.index[0]
                 
-                # 只填充 SPY 的空值，不删除行
-                result_df['Benchmark (SPY)'] = result_df['Benchmark (SPY)'].ffill()
+                # 截取该日期之后的 SPY
+                spy_series = spy_series[spy_series.index >= strategy_start_date]
+                
+                if not spy_series.empty:
+                    # 归一化：让 SPY 在策略开始的那一天，净值等于策略的初始资金
+                    base_value = spy_series.iloc[0]
+                    start_capital = result_df['Strategy'].iloc[0] # 应该是 initial_capital，但为了保险取第一笔
+                    
+                    spy_curve = (spy_series / base_value) * start_capital
+                    
+                    result_df = result_df.join(spy_curve.rename('Benchmark (SPY)'), how='left')
+                    result_df['Benchmark (SPY)'] = result_df['Benchmark (SPY)'].ffill()
             else:
                 logger.warning("Benchmark (SPY) data missing. Skipping benchmark comparison.")
         except Exception as e:

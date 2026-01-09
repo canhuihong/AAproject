@@ -10,9 +10,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("Backtest")
 
 class BacktestEngine:
-    def __init__(self, start_date='2023-01-01', initial_capital=100000.0):
+    def __init__(self, start_date='2023-01-01', initial_capital=100000.0, transaction_cost=0.001):
         self.start_date = pd.to_datetime(start_date)
         self.initial_capital = initial_capital
+        self.transaction_cost = transaction_cost
         self.db = DataManager()
         self.factor_engine = FactorEngine()
         
@@ -91,6 +92,7 @@ class BacktestEngine:
         
         full_curve = []
         current_capital = self.initial_capital
+        prev_weights = {} # 用于计算换手率
         
         # 遍历每个调仓周期
         for i in range(len(rebalance_dates) - 1):
@@ -147,8 +149,42 @@ class BacktestEngine:
 
             logger.info(f"   ✅ Position: {len(active_tickers)} stocks (Top: {active_tickers[:3]}...)")
 
+            # --- 2.5 交易成本计算 ---
+            # Turnover = sum(|w_new - w_old|)
+            all_tickers = set(weights.keys()) | set(prev_weights.keys())
+            turnover = sum(abs(weights.get(t, 0) - prev_weights.get(t, 0)) for t in all_tickers)
+            
+            # Cost = Turnover * Cap * Rate
+            # 注意：这里的 turnover 是双边的总变动比例 (比如卖10%买10%，turnover=20%)
+            # 这里的 transaction_cost 如果是单边的 (比如 10bps)，那么对于买和卖都要收
+            # 所以 0.001 * 20% = 0.02% 的总资产
+            cost = turnover * val * self.transaction_cost if (val := current_capital) > 0 else 0
+            
+            # 首日建仓 (prev_weights为空) 也算 Turnover (即 100% 买入)
+            if not prev_weights:
+                # 初始建仓只算买入的一边成本?
+                # 通常 Backtest 假设初始资金是现金，所以是买入 100%，Turnover=100%
+                # Cost = 1.0 * cost_rate
+                pass
+
+            current_capital -= cost
+            logger.info(f"   💸 Cost: ${cost:.2f} (Turnover: {turnover:.1%}) -> Net Cap: ${current_capital:,.0f}")
+            
+            # 更新 prev_weights
+            prev_weights = weights
+
             # --- 3. 模拟持有 ---
-            price_data = self._get_period_price_data(active_tickers, curr_date, next_date)
+            # 【修复未来函数】
+            # 我们在 curr_date 收盘后做决策，所以在下一天 (curr_date + 1) 开始持有
+            try:
+                trade_start_date = curr_date + pd.Timedelta(days=1)
+                
+                # 获取从 交易日 到 下个调仓日 的数据
+                # 注意：如果 next_date 也是 T+1，那这里会取不到数据，但在月度调仓下一般没事
+                price_data = self._get_period_price_data(active_tickers, trade_start_date, next_date)
+            except Exception as e:
+                logger.warning(f"   ⚠️ Error getting price data: {e}")
+                continue
             
             # 二次检查：确保我们买的股票在价格数据里真的存在
             # (get_period_price_data 可能会因为缺数据而丢弃某些列)

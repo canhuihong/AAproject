@@ -1,8 +1,10 @@
 import pandas as pd
 import numpy as np
 import logging
+import pandas_datareader.data as web
+import statsmodels.api as sm
 from src.data_manager import DataManager
-from src.config import FULL_BLOCKLIST
+from src.config import FULL_BLOCKLIST, FF_CACHE_PATH, PROXY_URL, DATA_DIR
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("FactorEngine")
@@ -154,7 +156,7 @@ class FactorEngine:
         
         return factors.dropna()
 
-    def get_scored_universe(self, analysis_date=None):
+    def get_scored_universe(self, analysis_date=None, top_n=None):
         """
         Runs the regression (5-Factor + Mom) and returns stocks ranked by Alpha.
         """

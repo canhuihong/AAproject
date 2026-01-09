@@ -2,20 +2,16 @@ import yfinance as yf
 import pandas as pd
 import datetime
 import time
+from tqdm import tqdm
 import logging
 import requests
 import os
 import random
 from io import StringIO
 
-# 进度条兼容性处理
-try:
-    from tqdm import tqdm
-except ImportError:
-    print("建议安装 tqdm: pip install tqdm")
-    def tqdm(iterable, desc=""): return iterable
-
-from src.config import DATA_DIR, ETF_BLOCKLIST, PROXY_URL, DB_PATH
+# 引入配置
+# 确保你的 src/config.py 里已经有了 SP500_LIMIT, SP600_LIMIT 这些定义
+from src.config import DATA_DIR, ETF_BLOCKLIST, PROXY_URL, DB_PATH, SP500_LIMIT, SP600_LIMIT, SP400_LIMIT, NASDAQ_LIMIT
 from src.data_manager import DataManager
 
 # 详细的日志格式
@@ -29,7 +25,6 @@ def get_tickers_from_wiki(url, name):
     """【爬虫】从维基百科获取代码 (稳健版 - 自动寻找正确表格)"""
     logger.info(f"🌐 Crawling {name} from Wikipedia...")
     
-    # 1. 设置完整的请求头 (伪装成浏览器)
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                       "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -45,7 +40,6 @@ def get_tickers_from_wiki(url, name):
         response = requests.get(url, headers=headers, proxies=proxies, timeout=20)
         response.raise_for_status()
         
-        # 解析表格
         tables = pd.read_html(StringIO(response.text))
         
         df = None
@@ -72,8 +66,26 @@ def get_tickers_from_wiki(url, name):
         else:
             col_name = target_col
             
-        # 清洗代码 (把 BRK.B 转为 BRK-B 以适配 Yahoo)
-        tickers = df[col_name].astype(str).str.replace('.', '-', regex=False).tolist()
+        raw_tickers = df[col_name].astype(str).tolist()
+        
+        cleaned_tickers = []
+        garbage_list = [
+            'CONSTITUENTS', 'EXCHANGES', 'SYMBOL', 'TICKER', 'SECURITY', 'COMPANY', 'GICS SECTOR', 
+            'FOUNDATION', 'OPERATOR', 'TYPE', 'WEBSITE'
+        ]
+        
+        for t in raw_tickers:
+            # 1. Basic Cleaning
+            t = t.replace('.', '-').replace('$', '').strip()
+            
+            # 2. Garbage Filter
+            if t.upper() in garbage_list: continue
+            if len(t) > 5 and not t.isalpha(): continue # Skip weird long strings
+            if not t: continue
+            
+            cleaned_tickers.append(t)
+            
+        tickers = cleaned_tickers
         
         logger.info(f"✅ Successfully fetched {len(tickers)} tickers for {name}")
         return tickers
@@ -84,14 +96,16 @@ def get_tickers_from_wiki(url, name):
 
 def process_single_stock(ticker, db, last_update_date=None, is_benchmark=False):
     """
-    【下载核心】处理单个股票 (含断点续传、周末跳过、财报清洗)
-    返回状态码：0=跳过, 1=更新, -1=失败
+    【下载核心】处理单个股票
+    升级点：混合下载年度(Financials)和季度(Quarterly)财报，解决历史数据不足问题
     """
     try:
         # ==========================================
         # A. 智能跳过判断 (Smart Skip)
         # ==========================================
-        download_period = "5y" # 默认下载长度
+        # 为了修复数据缺失，建议第一次运行时先把这里改短，或者直接删掉库重跑
+        # 这里保留 10y 的长度以确保覆盖 2021 年的回测需求
+        download_period = "10y" 
         start_date = None
         
         if last_update_date:
@@ -99,30 +113,53 @@ def process_single_stock(ticker, db, last_update_date=None, is_benchmark=False):
             today_dt = datetime.datetime.now()
             days_diff = (today_dt - last_dt).days
             
-            # 1. 极速检查：24小时内更新过 -> 绝对跳过
+            # 极速检查
             if days_diff < 1:
                 return 0 
             
-            # 2. 周末豁免：今天是周末且数据只滞后1-2天 -> 跳过
-            # (周六=5, 周日=6)
+            # 周末豁免
             if today_dt.weekday() >= 5 and days_diff <= 2: 
                 return 0
 
-            # 否则，设置增量下载的起始日期
+            # 增量更新
             next_day = last_dt + datetime.timedelta(days=1)
             
             # 【CRITICAL FIX】防止请求当天的还没产生的数据
             # 如果 next_day >= 今天，说明昨天的已经有了，今天的还没收盘 -> 跳过
             if next_day.date() >= datetime.datetime.now().date():
                 return 0
-                
             start_date = next_day.strftime('%Y-%m-%d')
             download_period = None 
+
+        # Santize ticker
+        original_ticker = ticker
+        ticker = ticker.replace('$', '').strip() 
+        if original_ticker != ticker:
+            logger.info(f"🔧 Sanitized ticker: {original_ticker} -> {ticker}")
 
         # ==========================================
         # B. 价格下载 (Price Data)
         # ==========================================
+        # logger.debug(f"Processing: {ticker}")
         obj = yf.Ticker(ticker)
+
+        # 【新增修复】 检查拆股 (Splits)
+        # 如果上次更新后发生了拆股，必须全量重下，否则价格不连续
+        if start_date:
+            try:
+                splits = obj.splits
+                if not splits.empty:
+                    # 找到最近一次拆股时间
+                    last_split_date = splits.index.max().to_pydatetime()
+                    last_db_date = datetime.datetime.strptime(last_update_date, '%Y-%m-%d')
+                    
+                    # 如果拆股发生在上次更新之后，或者就是同一天，强制重跑
+                    if last_split_date >= last_db_date:
+                        logger.info(f"🔄 Split detected for {ticker} on {last_split_date.date()}. Forcing full redownload.")
+                        start_date = None
+                        download_period = "10y"
+            except Exception:
+                pass # 获取拆股数据失败，安全起见按原计划跑 (或者也可以选择强制重跑，这里先保守)
         
         # 只有在确实需要下载时才联网
         hist = pd.DataFrame()
@@ -150,14 +187,11 @@ def process_single_stock(ticker, db, last_update_date=None, is_benchmark=False):
             
             records = []
             for d, row in hist.iterrows():
-                # 存入数据库
                 records.append((d.strftime('%Y-%m-%d'), ticker, row['Close'], row['Volume']))
             db.save_prices(records)
         
-        # 如果是Benchmark，不查财报，直接返回成功
+        # Benchmark 或 增量更新无数据时，直接返回
         if is_benchmark: return 1
-
-        # 如果增量更新时没下到价格(例如休市)，通常也无需查财报，节省时间
         if start_date and hist.empty: return 1
 
         # ==========================================
@@ -226,7 +260,8 @@ def main():
     db = DataManager()
     
     print("\n" + "="*60)
-    print("🚀 QML Reborn: Robust Update Mode (Weekends Safe)")
+    print("🚀 QML Reborn: Robust Update Mode (Hybrid Fundamentals)")
+    print("📢 Version: With Ticker Sanitization Fix (No $)")
     print("="*60)
 
     # 1. 扫描现状
@@ -246,6 +281,10 @@ def main():
 
     # 3. 抓取正股名单
     sp500 = get_tickers_from_wiki("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", "S&P 500")
+    if SP500_LIMIT is not None:
+        print(f"🚧 Test Mode: Limiting S&P 500 to first {SP500_LIMIT} stocks.")
+        sp500 = sp500[:SP500_LIMIT]
+
     sp600 = get_tickers_from_wiki("https://en.wikipedia.org/wiki/List_of_S%26P_600_companies", "S&P 600")
     sp400 = get_tickers_from_wiki("https://en.wikipedia.org/wiki/List_of_S%26P_400_companies", "S&P 400") # MidCap
     nasdaq100 = get_tickers_from_wiki("https://en.wikipedia.org/wiki/Nasdaq-100", "NASDAQ 100")
@@ -256,7 +295,7 @@ def main():
     print(f"\n🎯 Total Targets: {len(final_list)} stocks")
     print("-" * 60)
     
-    # 4. 批量执行 (带计数器)
+    # 4. 批量执行
     counts = {'Skip':0, 'Upd':0, 'Fail':0}
     pbar = tqdm(final_list, unit="stock")
     
@@ -269,11 +308,9 @@ def main():
         elif status == 1: counts['Upd'] += 1
         else: counts['Fail'] += 1
         
-        # 实时更新进度条后缀
         pbar.set_postfix(counts)
         
-        # 【恢复】简单的限流逻辑，防止 Yahoo 封禁
-        # 只有在发生真实网络请求(Upd)时才 sleep，Skip 时不 sleep
+        # 动态限流
         if status == 1:
             time.sleep(random.uniform(0.3, 0.7)) 
             # 每 50 个请求多歇会

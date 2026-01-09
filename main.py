@@ -5,6 +5,12 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
+# 强制 UTF-8 输出，防止 emoji 报错
+if sys.stdout.encoding.lower() != 'utf-8':
+    sys.stdout.reconfigure(encoding='utf-8')
+if sys.stderr.encoding.lower() != 'utf-8':
+    sys.stderr.reconfigure(encoding='utf-8')
+
 # 引入我们刚才写好的 Reporting 模块
 from src.reporting import ReportManager
 from src.factor_engine import FactorEngine
@@ -31,10 +37,12 @@ def run_live_mode(report):
     report.add_heading("Live Portfolio Recommendation")
     report.add_text("Based on the latest available market and fundamental data.")
     
-    engine = FactorEngine()
     # 动态获取昨天的日期作为分析日（确保有收盘价）
-    yesterday = (datetime.datetime.now() - datetime.timedelta(days=1)).strftime('%Y-%m-%d')
-    scored_df = engine.get_scored_universe(analysis_date=yesterday)
+    analysis_date = (datetime.datetime.now() - datetime.timedelta(days=1)).strftime('%Y-%m-%d')
+
+    # 2. 选股 (FF5+Mom Alpha Model)
+    engine = FactorEngine()
+    scored_df = engine.get_scored_universe(analysis_date=analysis_date, top_n=100)
     
     if scored_df.empty:
         msg = "No data found for scoring. Please run init_data.py first."
@@ -51,8 +59,8 @@ def run_live_mode(report):
     report.add_dataframe(top_picks.reset_index(), "Top 20 Scored Stocks (Raw)", max_rows=20)
 
     # 优化权重 (Max 10% per stock)
-    print(f"Optimizing allocation for {yesterday}...")
-    optimizer = PortfolioOptimizer(top_tickers, analysis_date=yesterday)
+    print(f"Optimizing allocation for {analysis_date}...")
+    optimizer = PortfolioOptimizer(top_tickers, analysis_date=analysis_date)
     allocation_df = optimizer.optimize_sharpe_ratio(max_weight=0.1)
     
     if allocation_df.empty:

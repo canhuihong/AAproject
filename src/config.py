@@ -86,6 +86,19 @@ IB_HOST = os.getenv("IB_HOST", "127.0.0.1")
 IB_PORT = int(os.getenv("IB_PORT", 7497))
 IB_CLIENT_ID = int(os.getenv("IB_CLIENT_ID", 1))
 
+# ==========================================
+# 7. 调试与测试配置 (Debug Limits)
+# ==========================================
+# 设置每次下载的股票数量上限 (测试用)
+# ⚠️ 注意：正式全量运行时，请将这两个值设为 None
+SP500_LIMIT = None   # 测试模式：只下 50 只
+SP600_LIMIT = None   # 测试模式：只下 50 只
+SP400_LIMIT = None   # 中盘股
+NASDAQ_LIMIT = None  # 科技股
+
+# Fama-French Data Cache
+FF_CACHE_PATH = DATA_DIR / "ff_factors.csv"
+
 if __name__ == "__main__":
     # 测试代码：直接运行 python src/config.py 可以检查配置是否正确
     print("-" * 30)
@@ -93,4 +106,8 @@ if __name__ == "__main__":
     print(f"📂 Project Root: {ROOT_DIR}")
     print(f"📡 Proxy:        {os.environ.get('HTTP_PROXY')}")
     print(f"🚫 Blocklist:    {len(FULL_BLOCKLIST)} items")
+    print(f"🚧 SP500 Limit:  {SP500_LIMIT}")
+    print(f"🚧 SP600 Limit:  {SP600_LIMIT}")
+    print(f"🚧 SP400 Limit:  {SP400_LIMIT}")
+    print(f"🚧 NASDAQ Limit: {NASDAQ_LIMIT}")
     print("-" * 30)

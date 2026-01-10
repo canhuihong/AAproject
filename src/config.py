@@ -111,3 +111,15 @@ if __name__ == "__main__":
     print(f"🚧 SP400 Limit:  {SP400_LIMIT}")
     print(f"🚧 NASDAQ Limit: {NASDAQ_LIMIT}")
     print("-" * 30)
+
+# ==========================================
+# 8. 回测与策略配置 (Strategy Config)
+# ==========================================
+# 集中管理策略参数，方便调优
+BACKTEST_CONFIG = {
+    'INITIAL_CAPITAL': 100000.0,
+    'START_DATE': '2021-12-01',
+    'TRANSACTION_COST': 0.001,  # 双边各千分之一 (10 bps)
+    'MAX_POSITION_WEIGHT': 0.10, # 单只股票最大仓位 10%
+    'REBALANCE_FREQ': 'M',      # 调仓频率 (M=Month, W=Week)
+}

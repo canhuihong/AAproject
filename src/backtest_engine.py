@@ -4,16 +4,17 @@ import logging
 from src.factor_engine import FactorEngine
 from src.optimizer import PortfolioOptimizer
 from src.data_manager import DataManager
+from src.config import BACKTEST_CONFIG
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("Backtest")
 
 class BacktestEngine:
-    def __init__(self, start_date='2023-01-01', initial_capital=100000.0, transaction_cost=0.001):
-        self.start_date = pd.to_datetime(start_date)
-        self.initial_capital = initial_capital
-        self.transaction_cost = transaction_cost
+    def __init__(self, start_date=None, initial_capital=None, transaction_cost=None):
+        self.start_date = pd.to_datetime(start_date or BACKTEST_CONFIG['START_DATE'])
+        self.initial_capital = initial_capital or BACKTEST_CONFIG['INITIAL_CAPITAL']
+        self.transaction_cost = transaction_cost or BACKTEST_CONFIG['TRANSACTION_COST']
         self.db = DataManager()
         self.factor_engine = FactorEngine()
         
@@ -70,15 +71,20 @@ class BacktestEngine:
         df['date'] = pd.to_datetime(df['date'])
         pivot = df.pivot(index='date', columns='ticker', values='close')
         
-        # 【关键修复】
-        # 1. 前向填充 (ffill): 如果某天停牌，用昨天价格
-        pivot = pivot.ffill()
+        # 【关键修复 V2】
+        # 1. 温和填充 (Soft Fill): 允许最多 3 天的数据缺失 (应对节假日或临时停牌)
+        pivot = pivot.ffill(limit=3)
         
-        # 2. 后向填充 (bfill): 如果第一天就停牌，用后面价格补（极少情况）
+        # 2. 后向填充 (bfill): 修复起始日的缺失
         pivot = pivot.bfill()
         
-        # 3. 如果还有 NaN (说明这只股票这段时间完全没数据)，直接丢弃该列
+        # 3. 统计并丢弃仍有空值的列
+        original_cols = len(pivot.columns)
         pivot = pivot.dropna(axis=1, how='any')
+        dropped_cols = original_cols - len(pivot.columns)
+        
+        if dropped_cols > 0:
+            logger.warning(f"   ⚠️ Dropped {dropped_cols} stocks due to insufficient data (after soft-fill).")
         
         return pivot
 

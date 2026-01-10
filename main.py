@@ -16,6 +16,7 @@ from src.reporting import ReportManager
 from src.factor_engine import FactorEngine
 from src.optimizer import PortfolioOptimizer
 from src.backtest_engine import BacktestEngine
+from src.config import BACKTEST_CONFIG
 
 # 修复路径
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -61,7 +62,7 @@ def run_live_mode(report):
     # 优化权重 (Max 10% per stock)
     print(f"Optimizing allocation for {analysis_date}...")
     optimizer = PortfolioOptimizer(top_tickers, analysis_date=analysis_date)
-    allocation_df = optimizer.optimize_sharpe_ratio(max_weight=0.1)
+    allocation_df = optimizer.optimize_sharpe_ratio(max_weight=BACKTEST_CONFIG['MAX_POSITION_WEIGHT'])
     
     if allocation_df.empty:
         print("Optimization failed.")
@@ -98,8 +99,10 @@ def run_backtest_mode(report):
     
     report.add_heading("Historical Backtest Results")
     
+    report.add_heading("Historical Backtest Results")
+    
     # 设定回测起点
-    backtester = BacktestEngine(start_date='2021-12-01', initial_capital=100000)
+    backtester = BacktestEngine(start_date=BACKTEST_CONFIG['START_DATE'], initial_capital=BACKTEST_CONFIG['INITIAL_CAPITAL'])
     results = backtester.run()
     
     if results.empty:

@@ -15,7 +15,7 @@ class DataManager:
         return sqlite3.connect(self.db_path, check_same_thread=False)
 
     def _initialize_db(self):
-        """初始化数据库表结构 (Schema V3)"""
+        """初始化数据库表结构 (Schema V4 - Added stock_info)"""
         conn = self._get_conn()
         cursor = conn.cursor()
         
@@ -43,6 +43,16 @@ class DataManager:
             total_assets REAL,    -- [FF5新增] 总资产 (用于 CMA)
             operating_income REAL,-- [FF5新增] 营业利润 (用于 RMW)
             PRIMARY KEY (date, ticker)
+        )
+        ''')
+        
+        # 3. 股票信息表 (Sector/Industry)
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS stock_info (
+            ticker TEXT PRIMARY KEY,
+            sector TEXT,
+            industry TEXT,
+            last_updated TEXT
         )
         ''')
         
@@ -144,3 +154,71 @@ class DataManager:
         
         # 4. 合并返回
         return pd.merge(df_price, df_fund, on='ticker', how='left')
+
+    def save_stock_info(self, records):
+        """批量保存股票板块信息 (records: list of tuples/dicts)"""
+        # records format: [(ticker, sector, industry, updated_date), ...]
+        if not records: return
+        conn = self._get_conn()
+        try:
+            conn.executemany(
+                'INSERT OR REPLACE INTO stock_info (ticker, sector, industry, last_updated) VALUES (?, ?, ?, ?)',
+                records
+            )
+            conn.commit()
+        except Exception as e:
+            logger.error(f"Save stock_info failed: {e}")
+        finally:
+            conn.close()
+
+    def get_sector_map(self):
+        """获取全市场板块映射 {ticker: sector}"""
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT ticker, sector FROM stock_info")
+            return {row[0]: row[1] for row in cursor.fetchall()}
+        except Exception as e:
+            logger.error(f"Failed to get sector map: {e}")
+            return {}
+        finally:
+            conn.close()
+
+    def get_risk_free_rate_series(self, start_date=None, end_date=None):
+        """
+        获取无风险利率序列 (Daily)
+        Source: ^IRX (13-week T-bill yield index)
+        Calculation: Yield / 100 / 252
+        Fallback: 0.04 / 252 (4% annual)
+        """
+        from src.config import RFR_TICKER
+        
+        conn = self._get_conn()
+        try:
+            # 1. Fetch IRX data
+            query = f"SELECT date, close FROM prices WHERE ticker = '{RFR_TICKER}'"
+            if start_date: query += f" AND date >= '{start_date}'"
+            if end_date: query += f" AND date <= '{end_date}'"
+            
+            df = pd.read_sql(query, conn)
+            
+            if df.empty:
+                logger.warning(f"No data found for {RFR_TICKER}. Using default 4.0% RFR.")
+                return pd.Series(dtype=float) # Return empty to trigger fallback downstream
+            
+            df['date'] = pd.to_datetime(df['date'])
+            df.set_index('date', inplace=True)
+            df.sort_index(inplace=True)
+            
+            # 2. Convert Index Value to Daily Rate
+            # ^IRX is quoted in annualized percentage (e.g., 4.25 means 4.25%)
+            # Daily Rate = (Close / 100) / 252
+            daily_rfr = (df['close'] / 100.0) / 252.0
+            
+            return daily_rfr
+            
+        except Exception as e:
+            logger.error(f"Failed to get RFR: {e}")
+            return pd.Series(dtype=float)
+        finally:
+            conn.close()

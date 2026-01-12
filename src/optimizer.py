@@ -16,6 +16,9 @@ class PortfolioOptimizer:
         # 初始化时直接清洗数据
         self.data, self.valid_tickers = self._fetch_and_clean_data()
         
+        # [Phase 2] Load Sector Map
+        self.sector_map = self.db.get_sector_map()
+        
     def _fetch_and_clean_data(self):
         """
         极度宽容的数据获取与清洗
@@ -96,6 +99,7 @@ class PortfolioOptimizer:
     def optimize_sharpe_ratio(self, max_weight=1.0):
         """
         核心方法：无论如何返回一个 DataFrame，绝不报错
+        [Phase 2 Upgrade] Adds Sector Constraints (Max 30% per sector)
         """
         # 1. 如果数据不足，直接返回等权重 (Equal Weight)
         if self.data.empty or not self.valid_tickers:
@@ -103,10 +107,58 @@ class PortfolioOptimizer:
             return self._get_equal_weights(self.tickers)
 
         num_assets = len(self.valid_tickers)
-        init_guess = [1.0 / num_assets] * num_assets
         
-        # 2. 定义优化问题
-        constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
+        # --- [Phase 2 Improvement] Feasible Initial Guess (Balanced Sector) ---
+        
+        # 1. Identify Sectors
+        sector_indices = {} 
+        for idx, ticker in enumerate(self.valid_tickers):
+            sec = self.sector_map.get(ticker, 'Unknown')
+            if sec not in sector_indices: sector_indices[sec] = []
+            sector_indices[sec].append(idx)
+            
+        num_sectors = len(sector_indices)
+        
+        # 2. Determine Feasible Constraint
+        # Min feasible max_weight = 1.0 / num_sectors
+        # Buffer to allow optimization room
+        min_feasible = 1.01 / max(1, num_sectors)
+        MAX_SECTOR_WEIGHT = max(0.30, min_feasible)
+        
+        if MAX_SECTOR_WEIGHT > 0.30:
+            logger.warning(f"⚠️ Only {num_sectors} sectors found. Relaxing constraint to {MAX_SECTOR_WEIGHT:.1%}")
+
+        # 3. Construct Balanced Initial Guess (Sector Equal Weight)
+        # Assign 1/N weight to each sector, divided by M stocks in that sector
+        init_guess = np.zeros(num_assets)
+        target_sector_weight = 1.0 / max(1, num_sectors)
+        
+        for sec, indices in sector_indices.items():
+            n_in_sec = len(indices)
+            if n_in_sec > 0:
+                w = target_sector_weight / n_in_sec
+                # If this violates individual max_weight, we might have an issue, 
+                # but max_weight is usually 0.1 or 0.15, and w is likely smaller.
+                # If w > max_weight, clip it (but then sum < 1).
+                # Let's simple clip and normalize later if needed.
+                init_guess[indices] = w
+                
+        # Final Normalize (to be safe against floating point errors)
+        if np.sum(init_guess) > 0:
+            init_guess /= np.sum(init_guess)
+        
+        # ----------------------------------------------------
+        
+        # 4. Define Constraints
+        constraints = [{'type': 'eq', 'fun': lambda x: np.sum(x) - 1}]
+        
+        for sec, indices in sector_indices.items():
+            def sector_constraint(x, idxs=indices, limit=MAX_SECTOR_WEIGHT):
+                return limit - np.sum(x[idxs])
+            constraints.append({'type': 'ineq', 'fun': sector_constraint})
+            
+        logger.info(f"Optimization Constraints: {len(constraints)} (1 Eq + {len(constraints)-1} Sector Ineq)")
+
         bounds = tuple((0.0, max_weight) for _ in range(num_assets))
         
         def neg_sharpe(weights):
@@ -117,7 +169,7 @@ class PortfolioOptimizer:
             except:
                 return 1e6
 
-        # 3. 尝试优化
+        # 5. Attempt Optimization
         try:
             result = minimize(
                 neg_sharpe, 
@@ -125,7 +177,7 @@ class PortfolioOptimizer:
                 method='SLSQP', 
                 bounds=bounds, 
                 constraints=constraints,
-                options={'maxiter': 50, 'ftol': 1e-6}
+                options={'maxiter': 100, 'ftol': 1e-6}
             )
             
             # 如果优化成功，使用结果；否则使用初始猜测
@@ -137,6 +189,12 @@ class PortfolioOptimizer:
                 final_weights = init_guess # 防止全变0
             else:
                 final_weights = final_weights / np.sum(final_weights)
+            
+            # Log valid result
+            if result.success:
+                logger.info("✅ Optimization Succeeded!")
+            else:
+                logger.warning(f"⚠️ Optimization Failed: {result.message}")
             
             return pd.DataFrame({'ticker': self.valid_tickers, 'weight': final_weights}).sort_values('weight', ascending=False)
 

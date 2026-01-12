@@ -18,7 +18,7 @@ class FactorEngine:
         self.db = DataManager()
         self.lookback_days = 252  # 1 year regression window
         self.min_observations = 50 # Reduced to 50 (approx 2.5 months) to allow faster entry
-        self.rfr = 0.04 / 252 # Daily Risk Free Rate (approx 4% annual)
+        # self.rfr removed; now dynamic
 
     def _get_historical_data(self, analysis_date):
         """Fetch price and fundamentals for the window"""
@@ -54,7 +54,11 @@ class FactorEngine:
             
         return df_price, df_fund
 
-    def _construct_factors(self, df_returns, df_fund_snapshot):
+    def _construct_factors(self, df_returns, df_fund_snapshot, rfr_series):
+        """
+        Construct Local Fama-French 5-Factors (Mkt, SMB, HML, RMW, CMA) + Momentum (MOM)
+        rfr_series: pandas Series of daily risk-free rates, aligned with df_returns index
+        """
         """
         Construct Local Fama-French 5-Factors (Mkt, SMB, HML, RMW, CMA) + Momentum (MOM)
         """
@@ -73,7 +77,7 @@ class FactorEngine:
         valid_tickers = df_returns.columns.intersection(df_fund_snapshot['ticker'])
         
         if len(valid_tickers) < 10:
-            return pd.DataFrame({'Mkt-RF': mkt_ret - self.rfr})
+            return pd.DataFrame({'Mkt-RF': mkt_ret - rfr_series})
 
         # Feature Vector
         metrics = df_fund_snapshot.set_index('ticker').loc[valid_tickers].copy()
@@ -146,7 +150,7 @@ class FactorEngine:
         
         # Combine
         factors = pd.DataFrame({
-            'Mkt-RF': mkt_ret - self.rfr,
+            'Mkt-RF': mkt_ret - rfr_series,
             'SMB': smb,
             'HML': hml,
             'RMW': rmw, 
@@ -194,8 +198,19 @@ class FactorEngine:
         if not df_fund.empty:
             logger.warning(f"DEBUG: df_fund sample ticker: {df_fund.iloc[0]['ticker']}")
 
+        # 2.5 Prepare RFR
+        # Dynamic Risk Free Rate Logic
+        if not df_returns.empty:
+            s_date = df_returns.index[0].strftime('%Y-%m-%d')
+            e_date = df_returns.index[-1].strftime('%Y-%m-%d')
+            rfr_raw = self.db.get_risk_free_rate_series(s_date, e_date)
+            # Align and Fill
+            rfr_series = rfr_raw.reindex(df_returns.index, method='ffill').fillna(0.04/252)
+        else:
+             rfr_series = pd.Series(0.04/252, index=df_returns.index)
+
         # 3. Construct 6 Factors
-        factors = self._construct_factors(df_returns, df_fund)
+        factors = self._construct_factors(df_returns, df_fund, rfr_series)
         
         logger.warning(f"DEBUG: Factors shape: {factors.shape}")
         if factors.empty: 
@@ -217,7 +232,8 @@ class FactorEngine:
         for ticker in Y_all.columns:
             if ticker in full_blocklist_set or ticker == 'SPY': continue
             
-            y = Y_all[ticker].values - self.rfr
+            # Use dynamic RFR for Excess Return
+            y = Y_all[ticker].values - rfr_series.loc[common_dates].values
             mask = ~np.isnan(y)
             if np.sum(mask) < self.min_observations: continue
             

@@ -11,7 +11,7 @@ from io import StringIO
 
 # 引入配置
 # 确保你的 src/config.py 里已经有了 SP500_LIMIT, SP600_LIMIT 这些定义
-from src.config import DATA_DIR, ETF_BLOCKLIST, PROXY_URL, DB_PATH, SP500_LIMIT, SP600_LIMIT, SP400_LIMIT, NASDAQ_LIMIT
+from src.config import DATA_DIR, ETF_BLOCKLIST, PROXY_URL, DB_PATH, SP500_LIMIT, SP600_LIMIT, SP400_LIMIT, NASDAQ_LIMIT, RFR_TICKER
 from src.data_manager import DataManager
 
 # 详细的日志格式
@@ -22,7 +22,7 @@ logger = logging.getLogger("InitData")
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
 def get_tickers_from_wiki(url, name):
-    """【爬虫】从维基百科获取代码 (稳健版 - 自动寻找正确表格)"""
+    """【爬虫】从维基百科获取代码 + 板块 (稳健版)"""
     logger.info(f"🌐 Crawling {name} from Wikipedia...")
     
     headers = {
@@ -44,51 +44,68 @@ def get_tickers_from_wiki(url, name):
         
         df = None
         target_col = None
+        sector_col = None
         
-        # 自动寻找包含 Ticker 或 Symbol 的表格
-        candidates = ['Symbol', 'Ticker', 'Ticker symbol', 'Ticker Symbol']
+        # 1. Data Cleaning / Column Detection
+        # 我们需要同时找到 Ticker 和 Sector
+        ticker_candidates = ['Symbol', 'Ticker', 'Ticker symbol', 'Ticker Symbol']
+        sector_candidates = ['GICS Sector', 'Sector', 'GICS Sector', 'Industry'] # Wikipedia 常用列名
         
         for table in tables:
-            # 检查列名
-            for candidate in candidates:
-                if candidate in table.columns:
-                    df = table
-                    target_col = candidate
+            # Check Ticker
+            found_ticker = None
+            for cand in ticker_candidates:
+                if cand in table.columns:
+                    found_ticker = cand
                     break
-            if df is not None:
+            
+            # Check Sector (Current logic: MUST find ticker, Sector is optional but preferred)
+            found_sector = None
+            for cand in sector_candidates:
+                if cand in table.columns:
+                    found_sector = cand
+                    break
+            
+            if found_ticker:
+                df = table
+                target_col = found_ticker
+                sector_col = found_sector # Might be None
                 break
                 
         if df is None:
-            # 如果找不到，回退到第一个表格 (可能是旧逻辑)
             logger.warning(f"⚠️ Could not find explicit Ticker column for {name}, trying first table...")
             df = tables[0]
-            col_name = df.columns[0]
-        else:
-            col_name = target_col
+            target_col = df.columns[0]
             
-        raw_tickers = df[col_name].astype(str).tolist()
+        # 2. Extract Data
+        # Returns list of dict: [{'ticker': 'AAPL', 'sector': 'Technology'}, ...]
+        results = []
         
-        cleaned_tickers = []
         garbage_list = [
             'CONSTITUENTS', 'EXCHANGES', 'SYMBOL', 'TICKER', 'SECURITY', 'COMPANY', 'GICS SECTOR', 
             'FOUNDATION', 'OPERATOR', 'TYPE', 'WEBSITE'
         ]
         
-        for t in raw_tickers:
-            # 1. Basic Cleaning
+        for idx, row in df.iterrows():
+            t = str(row[target_col])
+            
+            # Basic Cleaning
             t = t.replace('.', '-').replace('$', '').strip()
             
-            # 2. Garbage Filter
+            # Garbage Filter
             if t.upper() in garbage_list: continue
-            if len(t) > 5 and not t.isalpha(): continue # Skip weird long strings
+            if len(t) > 5 and not t.isalpha(): continue 
             if not t: continue
             
-            cleaned_tickers.append(t)
+            # Sector
+            sec = "Unknown"
+            if sector_col and sector_col in row:
+                sec = str(row[sector_col]).strip()
             
-        tickers = cleaned_tickers
-        
-        logger.info(f"✅ Successfully fetched {len(tickers)} tickers for {name}")
-        return tickers
+            results.append({'ticker': t, 'sector': sec})
+            
+        logger.info(f"✅ Successfully fetched {len(results)} items for {name}")
+        return results
         
     except Exception as e:
         logger.error(f"❌ Failed to scrape {name}: {e}")
@@ -191,7 +208,7 @@ def process_single_stock(ticker, db, last_update_date=None, is_benchmark=False):
             db.save_prices(records)
         
         # Benchmark 或 增量更新无数据时，直接返回
-        if is_benchmark: return 1
+        if is_benchmark or ticker == RFR_TICKER: return 1
         if start_date and hist.empty: return 1
 
         # ==========================================
@@ -213,11 +230,24 @@ def process_single_stock(ticker, db, last_update_date=None, is_benchmark=False):
                     ni = fin_df.loc['Net Income', date] if 'Net Income' in fin_df.index else 0
                     rev = fin_df.loc['Total Revenue', date] if 'Total Revenue' in fin_df.index else 0
                     
+                    # [New for FF5] Operating Income (RMW)
+                    # Try 'Operating Income' or 'EBIT'
+                    op_inc = 0
+                    if 'Operating Income' in fin_df.index:
+                        op_inc = fin_df.loc['Operating Income', date]
+                    elif 'EBIT' in fin_df.index:
+                        op_inc = fin_df.loc['EBIT', date]
+                        
                     eq = 0
                     for k in ['Stockholders Equity', 'Total Stockholder Equity', 'Total Equity']:
                         if k in bs_df.index:
                             eq = bs_df.loc[k, date]
                             break
+                            
+                    # [New for FF5] Total Assets (CMA)
+                    assets = 0
+                    if 'Total Assets' in bs_df.index:
+                        assets = bs_df.loc['Total Assets', date]
                     
                     # 60天前视偏差防护
                     eff_date = date + datetime.timedelta(days=60)
@@ -227,7 +257,9 @@ def process_single_stock(ticker, db, last_update_date=None, is_benchmark=False):
                         eff_date.strftime('%Y-%m-%d'), 
                         ticker, 
                         float(ni), float(eq), float(rev), float(shares), 
-                        date.strftime('%Y-%m-%d')
+                        date.strftime('%Y-%m-%d'),
+                        float(assets),       # New
+                        float(op_inc)        # New
                     ))
                 except Exception:
                     continue
@@ -279,25 +311,57 @@ def main():
     else:
         print("⚠️ SPY Update Failed (Check Network).")
 
-    # 3. 抓取正股名单
-    sp500 = get_tickers_from_wiki("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", "S&P 500")
+    # 2.1 强制检查 Risk Free Rate (^IRX)
+    print("\n-------- Checking Risk Free Rate (^IRX) --------")
+    rfr_status = process_single_stock(RFR_TICKER, db, existing_map.get(RFR_TICKER), is_benchmark=True)
+    if rfr_status == 1:
+        print("✅ RFR Data Updated.")
+    else:
+        print("⚠️ RFR Update Failed (Check Network).")
+
+    # 3. 抓取正股名单 + 板块信息
+    sp500_raw = get_tickers_from_wiki("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", "S&P 500")
     if SP500_LIMIT is not None:
         print(f"🚧 Test Mode: Limiting S&P 500 to first {SP500_LIMIT} stocks.")
-        sp500 = sp500[:SP500_LIMIT]
+        sp500_raw = sp500_raw[:SP500_LIMIT]
 
-    sp600 = get_tickers_from_wiki("https://en.wikipedia.org/wiki/List_of_S%26P_600_companies", "S&P 600")
-    sp400 = get_tickers_from_wiki("https://en.wikipedia.org/wiki/List_of_S%26P_400_companies", "S&P 400") # MidCap
-    nasdaq100 = get_tickers_from_wiki("https://en.wikipedia.org/wiki/Nasdaq-100", "NASDAQ 100")
+    sp600_raw = get_tickers_from_wiki("https://en.wikipedia.org/wiki/List_of_S%26P_600_companies", "S&P 600")
+    sp400_raw = get_tickers_from_wiki("https://en.wikipedia.org/wiki/List_of_S%26P_400_companies", "S&P 400") # MidCap
+    nasdaq_raw = get_tickers_from_wiki("https://en.wikipedia.org/wiki/Nasdaq-100", "NASDAQ 100")
     
-    full_list = sorted(list(set(sp500 + sp600 + sp400 + nasdaq100)))
-    final_list = [t for t in full_list if t not in ETF_BLOCKLIST]
+    # Merge Phase
+    # Use a dict to dedup by ticker, keeping the first non-Unknown sector found
+    merged_map = {}
     
-    print(f"\n🎯 Total Targets: {len(final_list)} stocks")
+    for item in sp500_raw + sp600_raw + sp400_raw + nasdaq_raw:
+        t = item['ticker']
+        s = item['sector']
+        
+        if t in ETF_BLOCKLIST: continue
+        
+        # If new or updating Unknown sector
+        if t not in merged_map:
+            merged_map[t] = s
+        elif merged_map[t] == 'Unknown' and s != 'Unknown':
+            merged_map[t] = s
+            
+    final_tickers = sorted(list(merged_map.keys()))
+    
+    # 3.1 保存 Sector 信息到数据库
+    print(f"💾 Saving Sector Info for {len(final_tickers)} stocks...")
+    now_str = datetime.datetime.now().strftime('%Y-%m-%d')
+    info_records = []
+    for t in final_tickers:
+        info_records.append((t, merged_map[t], None, now_str)) # (ticker, sector, industry, date)
+    
+    db.save_stock_info(info_records)
+    
+    print(f"\n🎯 Total Targets: {len(final_tickers)} stocks")
     print("-" * 60)
     
     # 4. 批量执行
     counts = {'Skip':0, 'Upd':0, 'Fail':0}
-    pbar = tqdm(final_list, unit="stock")
+    pbar = tqdm(final_tickers, unit="stock")
     
     for i, ticker in enumerate(pbar):
         last_date = existing_map.get(ticker)

@@ -57,6 +57,9 @@ ETF_BLOCKLIST = [
     'SHY', 'IEF', 'TIP', 'VNQ', 'XLK', 'XLF', 'XLV', 'XLE', 'XLY', 'XLP'
 ]
 
+# Risk Free Rate Ticker (13-Week Treasury Bill)
+RFR_TICKER = "^IRX"
+
 # B. 宏观指标 (有些 API 会混在一起，需要剔除)
 MACRO_BLOCKLIST = [
     'DGS10', 'T5YIE', 'T10Y2Y', 'BAMLC0A0CM', 'VIXCLS'

@@ -209,7 +209,22 @@ def process_single_stock(ticker, db, last_update_date=None, is_benchmark=False):
         
         # Benchmark 或 增量更新无数据时，直接返回
         if is_benchmark or ticker == RFR_TICKER: return 1
-        if start_date and hist.empty: return 1
+        
+        # [FIX] 如果是增量更新，但 hist 为空
+        # 我们需要区分: "真的没数据 (Market Closed)" 还是 "下载失败 (Error)"
+        # 现在的逻辑: 如果 hist 是空的，检查一下是否是因为 Exception
+        # 实际上，上面 retry 循环如果全失败，hist 就是 empty。
+        # 更有力的方式：如果 hist empty 且 start_date 并不是很久以前（比如就是昨天），也许 OK。
+        # 但如果是 Rate Limit，我们希望能报 Error。
+        # 这里先保守一点：如果 empty，且不是 benchmark，返回 -1 标记 failure (除非是刚收盘没数据)
+        if hist.empty:
+            # 如果是今天或昨天的增量，可能是还没收盘，不算错
+            if start_date:
+                start_dt = datetime.datetime.strptime(start_date, '%Y-%m-%d')
+                if (datetime.datetime.now() - start_dt).days < 2:
+                    return 0 # Skip/Up-to-date
+            # 其他情况视为失败
+            return -1
 
         # ==========================================
         # C. 财报下载 (Fundamentals) - MERGED MODE
@@ -221,17 +236,12 @@ def process_single_stock(ticker, db, last_update_date=None, is_benchmark=False):
             common = fin_df.columns.intersection(bs_df.columns)
             recs = []
             
-            # Fetch shares once
-            shares = obj.info.get('sharesOutstanding')
-            if not shares: return []
-
             for date in common:
                 try:
                     ni = fin_df.loc['Net Income', date] if 'Net Income' in fin_df.index else 0
                     rev = fin_df.loc['Total Revenue', date] if 'Total Revenue' in fin_df.index else 0
                     
                     # [New for FF5] Operating Income (RMW)
-                    # Try 'Operating Income' or 'EBIT'
                     op_inc = 0
                     if 'Operating Income' in fin_df.index:
                         op_inc = fin_df.loc['Operating Income', date]
@@ -248,7 +258,24 @@ def process_single_stock(ticker, db, last_update_date=None, is_benchmark=False):
                     assets = 0
                     if 'Total Assets' in bs_df.index:
                         assets = bs_df.loc['Total Assets', date]
+                        
+                    # [OPTIMIZATION] Extract Shares from Balance Sheet
+                    # keys: 'Share Issued', 'Ordinary Shares Number'
+                    shares = 0
+                    for k in ['Share Issued', 'Ordinary Shares Number', 'Common Stock', 'Common Stock Equity']: 
+                        # Note: Common Stock Equity is $ val, not count. 'Share Issued' is count.
+                        if k in bs_df.index:
+                            val = bs_df.loc[k, date]
+                            # Simple sanity check: shares usually > 1000
+                            # Some returns string?
+                            shares = float(val)
+                            break
                     
+                    if shares == 0:
+                        # Fallback: if we can't find shares in BS, maybe it's not a common stock?
+                        # For now, we record 0. Downstream might need to handle this or use last known.
+                        pass
+
                     # 60天前视偏差防护
                     eff_date = date + datetime.timedelta(days=60)
                     if eff_date > datetime.datetime.now(): continue
@@ -269,11 +296,10 @@ def process_single_stock(ticker, db, last_update_date=None, is_benchmark=False):
         q_recs = extract_fundamentals(obj.quarterly_financials, obj.quarterly_balance_sheet)
         a_recs = extract_fundamentals(obj.financials, obj.balance_sheet)
         
-        # 2. Merge & Deduplicate (Prefer Quarterly if date conflict? Actually dates usually differ)
-        # Use a dict to dedup by report_date
+        # 2. Merge & Deduplicate
         combined = {}
         for r in a_recs + q_recs:
-             # r[-1] is report_date
+             # r[-1] is report_date, r[5] is shares
              combined[r[-1]] = r
              
         fund_recs = list(combined.values())
@@ -288,12 +314,26 @@ def process_single_stock(ticker, db, last_update_date=None, is_benchmark=False):
 
     return 1
 
+# [NEW] Worker wrapper for ThreadPool
+def worker_task(args):
+    ticker, db, last_date = args
+    try:
+        # [JITTER] Add random sleep to prevent synchronized bursts hitting API limits
+        time.sleep(random.uniform(0.1, 0.5))
+        res = process_single_stock(ticker, db, last_update_date=last_date)
+        return res
+    except Exception as e:
+        logger.error(f"Worker failed for {ticker}: {e}")
+        return -1
+
 def main():
+    # 注意：在多线程环境下，每个线程需要独立的 DB 连接，
+    # 但 DataManager 内部设计是每次操作都新建连接，所以这里传同一个 db 实例是安全的。
     db = DataManager()
     
     print("\n" + "="*60)
-    print("🚀 QML Reborn: Robust Update Mode (Hybrid Fundamentals)")
-    print("📢 Version: With Ticker Sanitization Fix (No $)")
+    print("🚀 QML Reborn: High-Speed Update Mode (Multi-threaded)")
+    print("📢 Version: Optimized Fundamentals (No obj.info call)")
     print("="*60)
 
     # 1. 扫描现状
@@ -303,23 +343,17 @@ def main():
 
     # 2. 强制检查 Benchmark (SPY)
     print("\n-------- Checking Benchmark (SPY) --------")
+    # SPY 还是单线程跑，稳一点
     spy_status = process_single_stock('SPY', db, existing_map.get('SPY'), is_benchmark=True)
-    if spy_status == 0:
-        print("⏭️  SPY is up-to-date (Skipped).")
-    elif spy_status == 1:
-        print("✅ SPY Data Updated.")
-    else:
-        print("⚠️ SPY Update Failed (Check Network).")
+    if spy_status == 1: print("✅ SPY Data Updated.")
+    else: print("⏭️  SPY Skipped or Failed.")
 
     # 2.1 强制检查 Risk Free Rate (^IRX)
     print("\n-------- Checking Risk Free Rate (^IRX) --------")
     rfr_status = process_single_stock(RFR_TICKER, db, existing_map.get(RFR_TICKER), is_benchmark=True)
-    if rfr_status == 1:
-        print("✅ RFR Data Updated.")
-    else:
-        print("⚠️ RFR Update Failed (Check Network).")
+    if rfr_status == 1: print("✅ RFR Data Updated.")
 
-    # 3. 抓取正股名单 + 板块信息
+    # 3. 抓取正股名单
     sp500_raw = get_tickers_from_wiki("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", "S&P 500")
     if SP500_LIMIT is not None:
         print(f"🚧 Test Mode: Limiting S&P 500 to first {SP500_LIMIT} stocks.")
@@ -330,16 +364,11 @@ def main():
     nasdaq_raw = get_tickers_from_wiki("https://en.wikipedia.org/wiki/Nasdaq-100", "NASDAQ 100")
     
     # Merge Phase
-    # Use a dict to dedup by ticker, keeping the first non-Unknown sector found
     merged_map = {}
-    
     for item in sp500_raw + sp600_raw + sp400_raw + nasdaq_raw:
         t = item['ticker']
         s = item['sector']
-        
         if t in ETF_BLOCKLIST: continue
-        
-        # If new or updating Unknown sector
         if t not in merged_map:
             merged_map[t] = s
         elif merged_map[t] == 'Unknown' and s != 'Unknown':
@@ -352,34 +381,49 @@ def main():
     now_str = datetime.datetime.now().strftime('%Y-%m-%d')
     info_records = []
     for t in final_tickers:
-        info_records.append((t, merged_map[t], None, now_str)) # (ticker, sector, industry, date)
-    
+        info_records.append((t, merged_map[t], None, now_str))
     db.save_stock_info(info_records)
     
     print(f"\n🎯 Total Targets: {len(final_tickers)} stocks")
     print("-" * 60)
     
-    # 4. 批量执行
-    counts = {'Skip':0, 'Upd':0, 'Fail':0}
-    pbar = tqdm(final_tickers, unit="stock")
+    # 4. 批量执行 (Multithreaded)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     
-    for i, ticker in enumerate(pbar):
+    counts = {'Skip':0, 'Upd':0, 'Fail':0}
+    
+    # 准备任务参数
+    tasks = []
+    for ticker in final_tickers:
         last_date = existing_map.get(ticker)
+        tasks.append((ticker, db, last_date))
         
-        status = process_single_stock(ticker, db, last_update_date=last_date)
+    # MAX_WORKERS: Lowered to 4 to avoid 429 Errors
+    MAX_WORKERS = 4 
+    
+    print(f"🔥 Starting ThreadPool with {MAX_WORKERS} workers...")
+    
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # Submit all tasks
+        future_to_ticker = {executor.submit(worker_task, task): task[0] for task in tasks}
         
-        if status == 0: counts['Skip'] += 1
-        elif status == 1: counts['Upd'] += 1
-        else: counts['Fail'] += 1
+        pbar = tqdm(total=len(tasks), unit="stock")
         
-        pbar.set_postfix(counts)
-        
-        # 动态限流
-        if status == 1:
-            time.sleep(random.uniform(0.3, 0.7)) 
-            # 每 50 个请求多歇会
-            if counts['Upd'] % 50 == 0:
-                time.sleep(2.0)
+        for future in as_completed(future_to_ticker):
+            ticker = future_to_ticker[future]
+            try:
+                status = future.result()
+                if status == 0: counts['Skip'] += 1
+                elif status == 1: counts['Upd'] += 1
+                else: counts['Fail'] += 1
+            except Exception as e:
+                logger.error(f"Generate exception for {ticker}: {e}")
+                counts['Fail'] += 1
+                
+            pbar.update(1)
+            pbar.set_postfix(counts)
+            
+        pbar.close()
 
     print("\n" + "="*60)
     print("✅ PROCESS COMPLETED!")

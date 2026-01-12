@@ -186,7 +186,7 @@ class FactorEngine:
             return pd.DataFrame()
         
         pivot_prices = pivot_prices.sort_index()
-        df_returns = pivot_prices.pct_change().dropna(how='all').tail(self.lookback_days)
+        df_returns = pivot_prices.pct_change(fill_method=None).dropna(how='all').tail(self.lookback_days)
         
         if len(df_returns) < self.min_observations:
             logger.warning(f"Insufficient history. Found {len(df_returns)} days.")
@@ -222,59 +222,81 @@ class FactorEngine:
         Y_all = df_returns.loc[common_dates]
         X = factors.loc[common_dates]
         
-        # 4. Regression (Matrix Operation)
-        # X: [1, Mkt, SMB, HML, RMW, CMA, MOM]
+        # 4. Regression (Numba Accelerated)
+        try:
+            from src.numba_engine import run_parallel_ols
+        except ImportError:
+            logger.error("Numba engine missing. Reinstall numba.")
+            return pd.DataFrame()
+
+        # Prepare X (T x K)
+        # Add Constant to X
         X_design = np.column_stack([np.ones(len(X)), X.values])
         
-        results = []
+        # Prepare Y (T x N)
+        # We need to subtract RF from ALL columns efficiently
+        # RFR is aligned with common_dates
+        rfr_values = rfr_series.loc[common_dates].values
+        
         full_blocklist_set = set(FULL_BLOCKLIST)
         
-        for ticker in Y_all.columns:
-            if ticker in full_blocklist_set or ticker == 'SPY': continue
-            
-            # Use dynamic RFR for Excess Return
-            y = Y_all[ticker].values - rfr_series.loc[common_dates].values
-            mask = ~np.isnan(y)
-            if np.sum(mask) < self.min_observations: continue
-            
-            try:
-                beta, residuals, rank, s = np.linalg.lstsq(X_design[mask], y[mask], rcond=None)
-                
-                # Calculate Volatility (Std Dev of residuals or raw content?)
-                # We use raw volatility for filtering high risk stocks
-                volatility = np.std(y) * np.sqrt(252)
-
-                # Unwrap 7 params
-                res = {
-                    'ticker': ticker,
-                    'alpha': beta[0] * 252, # Annualized
-                    'volatility': volatility,
-                    'beta_mkt': beta[1],
-                    'beta_smb': beta[2],
-                    'beta_hml': beta[3],
-                    'beta_rmw': beta[4],
-                    'beta_cma': beta[5],
-                    'beta_mom': beta[6],
-                    'close': pivot_prices[ticker].iloc[-1]
-                }
-                results.append(res)
-            except:
-                continue
-                
-        # 5. Result
-        if not results: return pd.DataFrame()
+        # Align Y to common dates
+        # Note: Y_all might contain columns that are in blocklist
+        valid_tickers = [t for t in Y_all.columns if t not in full_blocklist_set and t != 'SPY']
         
-        df_res = pd.DataFrame(results).set_index('ticker')
+        if not valid_tickers:
+            return pd.DataFrame()
+            
+        Y_subset = Y_all[valid_tickers].loc[common_dates]
+        
+        # Vectorized Subtraction (Excess Returns)
+        # Y_subset is (T, N), rfr_values is (T,). Numpy broadcasting works if shape matches.
+        # rfr needs (T, 1) to broadcast across N columns
+        Y_excess = Y_subset.values - rfr_values[:, np.newaxis]
+        
+        # --- EXECUTE NUMBA ENGINE ---
+        logger.info(f"⚡ Starting Numba Parallel Regression for {len(valid_tickers)} stocks...")
+        import time
+        t0 = time.time()
+        
+        # Output: [Alpha, Vol, Beta_const, Beta_Mkt, Beta_SMB, ...]
+        raw_results = run_parallel_ols(Y_excess, X_design, min_obs=self.min_observations)
+        
+        t1 = time.time()
+        logger.info(f"⚡ Regression Finished in {t1-t0:.4f}s")
+        
+        # 5. Pack Results
+        # raw_results matches valid_tickers order
+        # Cols: 0: Alpha, 1: Vol, 2: Beta_Const (same as Alpha/252), 3: Beta_Mkt, ...
+        
+        # Map betas to names. X_design cols: [Const, Mkt, SMB, HML, RMW, CMA, MOM]
+        # raw_results cols: [Alpha, Vol, B_Const, B_Mkt, B_SMB, B_HML, B_RMW, B_CMA, B_MOM]
+        
+        df_res = pd.DataFrame(index=valid_tickers)
+        df_res['alpha'] = raw_results[:, 0]
+        df_res['volatility'] = raw_results[:, 1]
+        df_res['beta_mkt'] = raw_results[:, 3]
+        df_res['beta_smb'] = raw_results[:, 4]
+        df_res['beta_hml'] = raw_results[:, 5]
+        df_res['beta_rmw'] = raw_results[:, 6]
+        df_res['beta_cma'] = raw_results[:, 7]
+        df_res['beta_mom'] = raw_results[:, 8]
+        
+        # We also need 'close' price for final report
+        # pivot_prices columns -> tickers
+        curr_prices = pivot_prices.iloc[-1]
+        df_res['close'] = curr_prices.reindex(valid_tickers).values
+        
+        # Filter NaNs (failed regressions)
+        df_res.dropna(subset=['alpha'], inplace=True)
+
+        if df_res.empty: return pd.DataFrame()
         
         # --- Risk Filters ---
-        # 1. Beta Filter (New): Focus on Active Share
-        # Exclude High Beta (> 1.3): Avoid leveraged market plays
-        # Exclude Low Beta (< 0.1): Avoid dead money
+        # 1. Beta Filter
         df_res = df_res[(df_res['beta_mkt'] > 0.1) & (df_res['beta_mkt'] < 1.3)]
         
         # 2. Alpha Outlier Filter
-        # Removed strict Volatility filter to ensure we actually trade
-        # Relaxed Alpha Outlier Filter
         df_res = df_res[(df_res['alpha'] < 5.0) & (df_res['alpha'] > -2.0)]
         
         df_res.sort_values('alpha', ascending=False, inplace=True)

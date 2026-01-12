@@ -126,3 +126,67 @@ BACKTEST_CONFIG = {
     'MAX_POSITION_WEIGHT': 0.10, # 单只股票最大仓位 10%
     'REBALANCE_FREQ': 'M',      # 调仓频率 (M=Month, W=Week)
 }
+
+# ==========================================
+# 9. 因子引擎参数 (Factor Model)
+# ==========================================
+FACTOR_PARAMS = {
+    'LOOKBACK_DAYS': 252,          # 回归窗口 (1年)
+    'MIN_OBSERVATIONS': 60,        # 最小数据长度
+    'ALPHA_LOWER_BOUND': -2.0,     # Alpha 异常值下界
+    'ALPHA_UPPER_BOUND': 5.0,      # Alpha 异常值上界
+    'BETA_MIN': 0.1,               # Beta 过滤下界
+    'BETA_MAX': 1.3,               # Beta 过滤上界
+    # 评分权重
+    'WEIGHT_ALPHA': 0.5,
+    'WEIGHT_QUALITY': 0.3,         # Low Accruals
+    'WEIGHT_LOW_VOL': 0.2          # Low Volatility
+}
+
+# ==========================================
+# 10. 优化器参数 (Optimizer)
+# ==========================================
+OPTIMIZER_PARAMS = {
+    'MAX_ASSET_WEIGHT': 0.10,      # 单个资产上限
+    'MAX_SECTOR_WEIGHT': 0.30,     # 单行业上限
+    'MIN_HISTORY_DAYS': 60,        # 最小历史 (Valid history)
+    'RISK_FREE_RATE': 0.04         # 默认无风险利率 (Fallback)
+}
+
+# ==========================================
+# 11. 策略增强参数 (Strategy Enhancement)
+# ==========================================
+STRATEGY_PARAMS = {
+    'ENABLE_SMOOTHING': True,      # 启用信号平滑
+    'SMOOTHING_MONTHS': 3,         # 平滑窗口 (3个月)
+    'REGIME_SWITCHING': True,      # 启用动态择时
+    'ENABLE_BUFFER': True,         # 启用缓冲区规则 (Hysteresis)
+    'BUFFER_BUY_RANK': 15,         # 严进: 排名前15才买
+    'BUFFER_SELL_RANK': 25         # 宽出: (调优) 从30收窄到25，加速淘汰弱势股
+}
+
+# ==========================================
+# 12. 流动性过滤 (Liquidity Filters)
+# ==========================================
+LIQUIDITY_PARAMS = {
+    'MIN_PRICE': 5.0,              # 最低股价 ($)
+    'MIN_DOLLAR_VOLUME': 5000000   # 最低日均成交额 ($5M)
+}
+
+REGIME_WEIGHTS = {
+    'BULL': { # 牛市 (SPY > SMA200) -> 进攻
+        'WEIGHT_ALPHA': 0.8,
+        'WEIGHT_QUALITY': 0.2, 
+        'WEIGHT_LOW_VOL': 0.0
+    },
+    'BEAR': { # 熊市 (SPY < SMA200) -> 防守
+        'WEIGHT_ALPHA': 0.0,
+        'WEIGHT_QUALITY': 0.5,
+        'WEIGHT_LOW_VOL': 0.5
+    },
+    'NEUTRAL': { # 震荡/默认
+        'WEIGHT_ALPHA': 0.5,
+        'WEIGHT_QUALITY': 0.3,
+        'WEIGHT_LOW_VOL': 0.2
+    }
+}

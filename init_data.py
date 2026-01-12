@@ -259,6 +259,14 @@ def process_single_stock(ticker, db, last_update_date=None, is_benchmark=False):
                     if 'Total Assets' in bs_df.index:
                         assets = bs_df.loc['Total Assets', date]
                         
+                    # [New for Accruals] Operating Cash Flow
+                    # Keys can vary: 'Operating Cash Flow', 'Total Cash From Operating Activities'
+                    ocf = 0
+                    for k in ['Operating Cash Flow', 'Total Cash From Operating Activities']:
+                        if k in fin_df.index:
+                            ocf = fin_df.loc[k, date]
+                            break
+
                     # [OPTIMIZATION] Extract Shares from Balance Sheet
                     # keys: 'Share Issued', 'Ordinary Shares Number'
                     shares = 0
@@ -286,15 +294,29 @@ def process_single_stock(ticker, db, last_update_date=None, is_benchmark=False):
                         float(ni), float(eq), float(rev), float(shares), 
                         date.strftime('%Y-%m-%d'),
                         float(assets),       # New
-                        float(op_inc)        # New
+                        float(op_inc),       # New
+                        float(ocf)           # New (Cash Flow)
                     ))
                 except Exception:
                     continue
             return recs
 
         # 1. Get Both Sets
-        q_recs = extract_fundamentals(obj.quarterly_financials, obj.quarterly_balance_sheet)
-        a_recs = extract_fundamentals(obj.financials, obj.balance_sheet)
+        # Helper to merge Income & Cashflow for the "fin_df" argument
+        def merge_fin_cf(fin, cf):
+            if fin.empty and cf.empty: return pd.DataFrame()
+            if fin.empty: return cf
+            if cf.empty: return fin
+            # Concatenate rows (keys)
+            return pd.concat([fin, cf])
+
+        # Merge Quarterly
+        q_fin_all = merge_fin_cf(obj.quarterly_financials, obj.quarterly_cashflow)
+        q_recs = extract_fundamentals(q_fin_all, obj.quarterly_balance_sheet)
+        
+        # Merge Annual
+        a_fin_all = merge_fin_cf(obj.financials, obj.cashflow)
+        a_recs = extract_fundamentals(a_fin_all, obj.balance_sheet)
         
         # 2. Merge & Deduplicate
         combined = {}

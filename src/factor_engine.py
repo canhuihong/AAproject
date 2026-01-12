@@ -4,7 +4,7 @@ import logging
 import pandas_datareader.data as web
 import statsmodels.api as sm
 from src.data_manager import DataManager
-from src.config import FULL_BLOCKLIST, FF_CACHE_PATH, PROXY_URL, DATA_DIR
+from src.config import FULL_BLOCKLIST, FF_CACHE_PATH, PROXY_URL, DATA_DIR, FACTOR_PARAMS, STRATEGY_PARAMS, REGIME_WEIGHTS, LIQUIDITY_PARAMS
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("FactorEngine")
@@ -16,24 +16,62 @@ class FactorEngine:
     """
     def __init__(self):
         self.db = DataManager()
-        self.lookback_days = 252  # 1 year regression window
-        self.min_observations = 50 # Reduced to 50 (approx 2.5 months) to allow faster entry
+        self.lookback_days = FACTOR_PARAMS['LOOKBACK_DAYS']
+        self.min_observations = FACTOR_PARAMS['MIN_OBSERVATIONS']
         # self.rfr removed; now dynamic
+
+    def _detect_market_regime(self, analysis_date):
+        """
+        Determine Market Regime (Bull/Bear) based on SPY vs SMA200.
+        Returns: 'BULL' | 'BEAR' | 'NEUTRAL'
+        """
+        if not STRATEGY_PARAMS['REGIME_SWITCHING']:
+            return 'NEUTRAL'
+            
+        try:
+            # Lookback 300 days to calculate SMA200
+            start_date = (pd.Timestamp(analysis_date) - pd.Timedelta(days=400)).strftime('%Y-%m-%d')
+            
+            conn = self.db._get_conn()
+            query = f"SELECT date, close FROM prices WHERE ticker = 'SPY' AND date >= '{start_date}' AND date <= '{analysis_date}' ORDER BY date"
+            df = pd.read_sql(query, conn)
+            conn.close()
+            
+            if len(df) < 200:
+                logger.warning("Not enough SPY history for Regime Detection. Defaulting to NEUTRAL.")
+                return 'NEUTRAL'
+                
+            df['SMA200'] = df['close'].rolling(200).mean()
+            current_price = df['close'].iloc[-1]
+            current_sma = df['SMA200'].iloc[-1]
+            
+            if pd.isna(current_sma): return 'NEUTRAL'
+            
+            if current_price > current_sma:
+                logger.info(f"📈 Market Regime: BULL (SPY {current_price:.2f} > SMA200 {current_sma:.2f})")
+                return 'BULL'
+            else:
+                logger.info(f"📉 Market Regime: BEAR (SPY {current_price:.2f} < SMA200 {current_sma:.2f})")
+                return 'BEAR'
+                
+        except Exception as e:
+            logger.error(f"Regime detection failed: {e}")
+            return 'NEUTRAL'
 
     def _get_historical_data(self, analysis_date):
         """Fetch price and fundamentals for the window"""
         conn = self.db._get_conn()
         
-        # 1. Get Prices
+        # 1. Get Prices (and Volume for liquidity filter)
         # We need enough buffer for lookback
         start_date = (pd.Timestamp(analysis_date) - pd.Timedelta(days=self.lookback_days * 2)).strftime('%Y-%m-%d')
-        query_prices = f"SELECT date, ticker, close FROM prices WHERE date >= '{start_date}' AND date <= '{analysis_date}'"
+        query_prices = f"SELECT date, ticker, close, volume FROM prices WHERE date >= '{start_date}' AND date <= '{analysis_date}'"
         
-        # 2. Get Fundamentals (for SMB/HML construction)
+        # 2. Get Fundamentals (for SMB/HML construction + Accruals)
         # We need the latest snapshot relative to analysis_date
         # Fix: Ensure we don't pick up "hollow" rows (shares update only) that have NULL financials
         query_fund = f"""
-            SELECT f.ticker, f.total_equity, f.shares_count, f.net_income, f.total_revenue
+            SELECT f.ticker, f.total_equity, f.shares_count, f.net_income, f.total_revenue, f.total_assets, f.operating_cash_flow
             FROM fundamentals f
             INNER JOIN (
                 SELECT ticker, MAX(date) as max_date
@@ -160,14 +198,19 @@ class FactorEngine:
         
         return factors.dropna()
 
-    def get_scored_universe(self, analysis_date=None, top_n=None):
+    def _compute_single_snapshot(self, analysis_date, weights=None):
         """
-        Runs the regression (5-Factor + Mom) and returns stocks ranked by Alpha.
+        Internal: Runs the regression for a specific date with specific weights
         """
-        if not analysis_date:
-            analysis_date = (pd.Timestamp.now() - pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+        if weights is None:
+            # Fallback to default
+            weights = {
+                'WEIGHT_ALPHA': FACTOR_PARAMS['WEIGHT_ALPHA'],
+                'WEIGHT_QUALITY': FACTOR_PARAMS['WEIGHT_QUALITY'],
+                'WEIGHT_LOW_VOL': FACTOR_PARAMS['WEIGHT_LOW_VOL']
+            }
             
-        logger.info(f"Running Fama-French 5-Factor + MOM Regression for {analysis_date}...")
+        logger.info(f"Running Fama-French Regression for {analysis_date}...")
         
         # 1. Load Data
         df_price, df_fund = self._get_historical_data(analysis_date)
@@ -178,14 +221,41 @@ class FactorEngine:
             logger.warning("DEBUG: df_price is empty!")
             return pd.DataFrame()
         
-        # 2. Pivot
+        # 2. Pivot Price & Volume
         df_price['date'] = pd.to_datetime(df_price['date'])
         try:
-            pivot_prices = df_price.drop_duplicates(subset=['date', 'ticker']).pivot(index='date', columns='ticker', values='close')
+            df_dedup = df_price.drop_duplicates(subset=['date', 'ticker'])
+            pivot_prices = df_dedup.pivot(index='date', columns='ticker', values='close')
+            pivot_volume = df_dedup.pivot(index='date', columns='ticker', values='volume')
         except Exception:
             return pd.DataFrame()
         
         pivot_prices = pivot_prices.sort_index()
+        
+        # --- 2.1 Liquidity Filter ---
+        # Calculate Average Dollar Volume (last 20 days)
+        last_prices = pivot_prices.ffill().iloc[-1]
+        avg_volume = pivot_volume.rolling(20).mean().iloc[-1]
+        avg_dollar_vol = last_prices * avg_volume
+        
+        # Filter Mask
+        # A. Price > MIN_PRICE
+        mask_price = last_prices >= LIQUIDITY_PARAMS['MIN_PRICE']
+        
+        # B. Dollar Vol > MIN_DOLLAR_VOLUME
+        mask_vol = avg_dollar_vol >= LIQUIDITY_PARAMS['MIN_DOLLAR_VOLUME']
+        
+        valid_liquidity_tickers = last_prices.index[mask_price & mask_vol]
+        
+        logger.info(f"   💧 Liquidity Filter: {len(pivot_prices.columns)} -> {len(valid_liquidity_tickers)} stocks")
+        
+        if len(valid_liquidity_tickers) < 10:
+             return pd.DataFrame()
+             
+        # Filter the pivot tables
+        pivot_prices = pivot_prices[valid_liquidity_tickers]
+        
+        # 2.2 Calculate Returns
         df_returns = pivot_prices.pct_change(fill_method=None).dropna(how='all').tail(self.lookback_days)
         
         if len(df_returns) < self.min_observations:
@@ -292,17 +362,127 @@ class FactorEngine:
 
         if df_res.empty: return pd.DataFrame()
         
-        # --- Risk Filters ---
-        # 1. Beta Filter
-        df_res = df_res[(df_res['beta_mkt'] > 0.1) & (df_res['beta_mkt'] < 1.3)]
+        if df_res.empty: return pd.DataFrame()
         
-        # 2. Alpha Outlier Filter
-        df_res = df_res[(df_res['alpha'] < 5.0) & (df_res['alpha'] > -2.0)]
+        # --- Risk Filters (Beta) ---
+        df_res = df_res[(df_res['beta_mkt'] >= FACTOR_PARAMS['BETA_MIN']) & 
+                        (df_res['beta_mkt'] <= FACTOR_PARAMS['BETA_MAX'])]
         
-        df_res.sort_values('alpha', ascending=False, inplace=True)
+        # --- Alpha Outlier Filter ---
+        df_res = df_res[(df_res['alpha'] < FACTOR_PARAMS['ALPHA_UPPER_BOUND']) & 
+                        (df_res['alpha'] > FACTOR_PARAMS['ALPHA_LOWER_BOUND'])]
         
-        # Compatibility
-        df_res['final_score'] = df_res['alpha']
+        if df_res.empty: return pd.DataFrame()
+
+        # ==========================================
+        # 6. Composite Scoring (Multi-Factor)
+        # ==========================================
+        valid_fund = df_fund.set_index('ticker').reindex(df_res.index)
         
-        logger.info(f"Regression complete. Top: {df_res.index[0]} (Alpha: {df_res.iloc[0]['alpha']:.2%})")
+        # A. Quality Factor: Accruals
+        # Accruals = (Net Income - Operating Cash Flow) / Total Assets
+        # Interpretation: High Accruals = Low Quality (Fake Earnings) -> We want LOW Accruals
+        try:
+            accruals = (valid_fund['net_income'] - valid_fund['operating_cash_flow']) / valid_fund['total_assets']
+            accruals = accruals.fillna(0) # If missing, assume neutral
+        except KeyError:
+            # If OCF column missing (old DB), assume 0
+            accruals = pd.Series(0, index=df_res.index)
+            
+        df_res['accruals'] = accruals
+        
+        # B. Z-Score Standardization (Robust to scale differences)
+        
+        # Helper: Rank and Z-Score (Percentile might be better but Z-score is standard)
+        def robust_zscore(series):
+            if len(series) < 2: return pd.Series(0, index=series.index)
+            # Clip outliers first to avoiding skewing the mean
+            shrunk = series.clip(lower=series.quantile(0.01), upper=series.quantile(0.99))
+            return (shrunk - shrunk.mean()) / (shrunk.std() + 1e-6)
+
+        z_alpha = robust_zscore(df_res['alpha'])
+        
+        # For Volatility and Accruals, LOWER is BETTER. So we negate them.
+        z_low_vol = robust_zscore(df_res['volatility']) * -1.0
+        z_quality = robust_zscore(df_res['accruals']) * -1.0 
+        
+        # C. Weighted Sum
+        w_alpha = weights['WEIGHT_ALPHA']
+        w_quality = weights['WEIGHT_QUALITY']
+        w_vol = weights['WEIGHT_LOW_VOL']
+        
+        df_res['final_score'] = (z_alpha * w_alpha) + (z_quality * w_quality) + (z_low_vol * w_vol)
+        
+        df_res.sort_values('final_score', ascending=False, inplace=True)
+        
+        logger.info(f"Scoring Complete. Top: {df_res.index[0]} (Score: {df_res.iloc[0]['final_score']:.2f} | Alpha: {df_res.iloc[0]['alpha']:.2%})")
         return df_res
+
+    def get_scored_universe(self, analysis_date=None, top_n=None):
+        """
+        Public API: Returns the final scored universe.
+        Includes:
+        1. Regime Switching (Dynamic Weights)
+        2. Signal Smoothing (Tri-Month Average)
+        """
+        if not analysis_date:
+            analysis_date = (pd.Timestamp.now() - pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+            
+        # 1. Regime Detection
+        regime = self._detect_market_regime(analysis_date)
+        weights = REGIME_WEIGHTS.get(regime, REGIME_WEIGHTS['NEUTRAL'])
+        
+        logger.info(f"🔮 Strategy Mode: {regime} | Weights: {weights}")
+        
+        # 2. Signal Smoothing
+        if not STRATEGY_PARAMS['ENABLE_SMOOTHING']:
+            return self._compute_single_snapshot(analysis_date, weights)
+            
+        logger.info(f"🌊 Smoothing Enabled: Averaging last {STRATEGY_PARAMS['SMOOTHING_MONTHS']} months...")
+        
+        score_frames = []
+        
+        # Loop back N months (approx 30 days per month)
+        for i in range(STRATEGY_PARAMS['SMOOTHING_MONTHS']):
+            lookback_date = (pd.Timestamp(analysis_date) - pd.Timedelta(days=30 * i)).strftime('%Y-%m-%d')
+            
+            logger.info(f"   > Snapshot {i+1}: {lookback_date}")
+            df = self._compute_single_snapshot(lookback_date, weights)
+            
+            if not df.empty:
+                score_frames.append(df[['final_score', 'alpha', 'close']])
+                
+        if not score_frames:
+            return pd.DataFrame()
+            
+        # 3. Combine and Average
+        # Concat all frames
+        combined = pd.concat(score_frames, axis=1)
+        # We need to average 'final_score' across columns. 
+        # But 'final_score' appears multiple times.
+        # Safer way: average by index
+        
+        # Create a DF containing only final_scores
+        scores_only = pd.DataFrame()
+        for i, df in enumerate(score_frames):
+            scores_only[f'score_{i}'] = df['final_score']
+            
+        # Average Score
+        avg_score = scores_only.mean(axis=1)
+        
+        # Get the latest other data (alpha, close) from the *first* frame (analysis_date)
+        # We only keep stocks that exist in the LATEST snapshot (analysis_date).
+        # Stocks that dropped out are ignored.
+        latest_df = score_frames[0].copy()
+        
+        # Update final_score with average
+        # We intersection with avg_score to handle cases where stock didn't exist in past (less smoothing)
+        common_idx = latest_df.index.intersection(avg_score.index)
+        latest_df.loc[common_idx, 'final_score'] = avg_score.loc[common_idx]
+        
+        # Sort
+        latest_df.sort_values('final_score', ascending=False, inplace=True)
+        
+        logger.info(f"✅ Smoothing Complete. Top: {latest_df.index[0]} (Avg Score: {latest_df.iloc[0]['final_score']:.2f})")
+        
+        return latest_df

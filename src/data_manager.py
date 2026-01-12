@@ -42,6 +42,7 @@ class DataManager:
             report_period TEXT,   -- 原始财报日期
             total_assets REAL,    -- [FF5新增] 总资产 (用于 CMA)
             operating_income REAL,-- [FF5新增] 营业利润 (用于 RMW)
+            operating_cash_flow REAL, -- [New] 经营性现金流 (用于 Accruals)
             PRIMARY KEY (date, ticker)
         )
         ''')
@@ -60,6 +61,7 @@ class DataManager:
         try:
             cursor.execute("ALTER TABLE fundamentals ADD COLUMN total_assets REAL")
             cursor.execute("ALTER TABLE fundamentals ADD COLUMN operating_income REAL")
+            cursor.execute("ALTER TABLE fundamentals ADD COLUMN operating_cash_flow REAL")
         except:
             pass # 已经存在或失败忽略
 
@@ -88,8 +90,8 @@ class DataManager:
         try:
             conn.executemany(
                 '''INSERT OR REPLACE INTO fundamentals 
-                   (date, ticker, net_income, total_equity, total_revenue, shares_count, report_period, total_assets, operating_income) 
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                   (date, ticker, net_income, total_equity, total_revenue, shares_count, report_period, total_assets, operating_income, operating_cash_flow) 
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                 records
             )
             conn.commit()

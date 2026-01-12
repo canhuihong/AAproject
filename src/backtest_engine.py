@@ -4,7 +4,7 @@ import logging
 from src.factor_engine import FactorEngine
 from src.optimizer import PortfolioOptimizer
 from src.data_manager import DataManager
-from src.config import BACKTEST_CONFIG
+from src.config import BACKTEST_CONFIG, STRATEGY_PARAMS
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -88,6 +88,46 @@ class BacktestEngine:
         
         return pivot
 
+    def _apply_buffer_rule(self, scored_df, current_holdings, target_size=20):
+        """
+        Apply Hysteresis to reduce turnover.
+        Logic:
+        1. Keep 'Held' stocks if Rank <= SELL_RANK (e.g. 30)
+        2. Buy 'New' stocks if Rank <= BUY_RANK (e.g. 15)
+        3. Sort candidates by Score and take Top N.
+        """
+        if not STRATEGY_PARAMS.get('ENABLE_BUFFER', False):
+            return scored_df.head(target_size).index.tolist()
+            
+        buy_threshold = STRATEGY_PARAMS['BUFFER_BUY_RANK']
+        sell_threshold = STRATEGY_PARAMS['BUFFER_SELL_RANK']
+        
+        candidates = []
+        
+        # We need the rank (1-based)
+        # scored_df is already sorted by final_score descending
+        
+        for rank_0, (ticker, row) in enumerate(scored_df.iterrows()):
+            rank = rank_0 + 1
+            score = row['final_score']
+            is_held = ticker in current_holdings
+            
+            # Rule 1: Keeper
+            if is_held and rank <= sell_threshold:
+                candidates.append({'ticker': ticker, 'score': score, 'is_held': True})
+                
+            # Rule 2: Challenger
+            elif not is_held and rank <= buy_threshold:
+                candidates.append({'ticker': ticker, 'score': score, 'is_held': False})
+                
+        # Sort by Score (High to Low)
+        candidates.sort(key=lambda x: x['score'], reverse=True)
+        
+        # Take Top N
+        final_list = [x['ticker'] for x in candidates[:target_size]]
+        
+        return final_list
+
     def run(self):
         rebalance_dates = self.get_rebalance_schedule()
         if len(rebalance_dates) < 2:
@@ -128,7 +168,9 @@ class BacktestEngine:
                 full_curve.append(pd.Series(current_capital, index=dates))
                 continue
                 
-            top_tickers = scored_df.head(20).index.tolist()
+            # [MODIFIED] Stock Selection with Buffer
+            current_holdings = set(prev_weights.keys())
+            top_tickers = self._apply_buffer_rule(scored_df, current_holdings, target_size=20)
             
             # --- 2. 优化权重 (Max 10%) ---
             try:

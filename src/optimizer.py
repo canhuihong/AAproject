@@ -4,8 +4,9 @@ from scipy.optimize import minimize
 import logging
 from src.data_manager import DataManager
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("Optimizer")
+from src.config import OPTIMIZER_PARAMS, logger as global_logger
+# Use the global logger instead of creating a new one to keep config consistent
+logger = global_logger
 
 class PortfolioOptimizer:
     def __init__(self, tickers, analysis_date, risk_free_rate=0.04):
@@ -56,7 +57,8 @@ class PortfolioOptimizer:
         
         # 2. 只有当有效数据长度 > 60天 (约3个月) 才保留
         # 之前的 126天可能太严格，导致所有股票都被剔除
-        min_history = 60 
+        # 之前可能硬编码了，现在统一走 Config
+        min_history = OPTIMIZER_PARAMS['MIN_HISTORY_DAYS'] 
         valid_cols = []
         for col in pivot_df.columns:
             if pivot_df[col].count() >= min_history:

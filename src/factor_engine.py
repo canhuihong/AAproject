@@ -4,7 +4,7 @@ import logging
 import pandas_datareader.data as web
 import statsmodels.api as sm
 from src.data_manager import DataManager
-from src.config import FULL_BLOCKLIST, FF_CACHE_PATH, PROXY_URL, DATA_DIR, FACTOR_PARAMS, STRATEGY_PARAMS, REGIME_WEIGHTS, LIQUIDITY_PARAMS
+from src.config import FULL_BLOCKLIST, FF_CACHE_PATH, PROXY_URL, DATA_DIR, FACTOR_PARAMS, STRATEGY_PARAMS, REGIME_WEIGHTS, LIQUIDITY_PARAMS, MACRO_PARAMS
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("FactorEngine")
@@ -19,41 +19,117 @@ class FactorEngine:
         self.lookback_days = FACTOR_PARAMS['LOOKBACK_DAYS']
         self.min_observations = FACTOR_PARAMS['MIN_OBSERVATIONS']
         # self.rfr removed; now dynamic
+        
+        # [Cache] Store computed snapshots to avoid redundant regression calls
+        # Key: analysis_date (str), Value: DataFrame
+        self._score_cache = {}
 
     def _detect_market_regime(self, analysis_date):
         """
-        Determine Market Regime (Bull/Bear) based on SPY vs SMA200.
-        Returns: 'BULL' | 'BEAR' | 'NEUTRAL'
+        [Macro Awareness Update]
+        Determine Market Regime based on:
+        1. VIX Level (Fear)
+        2. SPY Trend (Technical)
+        3. Yield Curve (Recession Warning)
+        
+        Returns: 'STRONG_BULL' | 'BULL' | 'CORRECTION' | 'CRISIS'
         """
         if not STRATEGY_PARAMS['REGIME_SWITCHING']:
             return 'NEUTRAL'
             
         try:
-            # Lookback 300 days to calculate SMA200
-            start_date = (pd.Timestamp(analysis_date) - pd.Timedelta(days=400)).strftime('%Y-%m-%d')
+            # 1. Fetch Data Inputs
+            # Lookback window for technicals (SMA200)
+            start_date_tech = (pd.Timestamp(analysis_date) - pd.Timedelta(days=400)).strftime('%Y-%m-%d')
             
             conn = self.db._get_conn()
-            query = f"SELECT date, close FROM prices WHERE ticker = 'SPY' AND date >= '{start_date}' AND date <= '{analysis_date}' ORDER BY date"
-            df = pd.read_sql(query, conn)
+            
+            # A. Get SPY for Trend
+            df_spy = pd.read_sql(f"SELECT date, close FROM prices WHERE ticker = 'SPY' AND date >= '{start_date_tech}' AND date <= '{analysis_date}' ORDER BY date", conn)
+            
+            # B. Get Macro Indicators (Single Day Snapshot is usually enough, but we take last 5 days to be safe against missing data)
+            start_date_macro = (pd.Timestamp(analysis_date) - pd.Timedelta(days=7)).strftime('%Y-%m-%d')
+            
+            # Fetch VIX, TNX (10Y), IRX (13W ~ 3M)
+            # Note: IRX is yield * 10 (e.g., 4.5 index = 4.5% yield? No, Yahoo ^IRX is usually standard yield)
+            # Let's assume standard % format.
+            df_macro = pd.read_sql(f"SELECT date, ticker, close FROM prices WHERE ticker IN ('^VIX', '^TNX', '^IRX') AND date >= '{start_date_macro}' AND date <= '{analysis_date}'", conn)
+            
             conn.close()
             
-            if len(df) < 200:
-                logger.warning("Not enough SPY history for Regime Detection. Defaulting to NEUTRAL.")
-                return 'NEUTRAL'
-                
-            df['SMA200'] = df['close'].rolling(200).mean()
-            current_price = df['close'].iloc[-1]
-            current_sma = df['SMA200'].iloc[-1]
-            
-            if pd.isna(current_sma): return 'NEUTRAL'
-            
-            if current_price > current_sma:
-                logger.info(f"📈 Market Regime: BULL (SPY {current_price:.2f} > SMA200 {current_sma:.2f})")
-                return 'BULL'
+            # --- Technical Score ---
+            if len(df_spy) < 200:
+                tech_score = 0
             else:
-                logger.info(f"📉 Market Regime: BEAR (SPY {current_price:.2f} < SMA200 {current_sma:.2f})")
-                return 'BEAR'
+                sma200 = df_spy['close'].rolling(200).mean().iloc[-1]
+                curr_price = df_spy['close'].iloc[-1]
+                if pd.isna(sma200): tech_score = 0
+                elif curr_price > sma200: tech_score = 1
+                else: tech_score = -1
                 
+            # --- VIX Score ---
+            vix_score = 0
+            last_vix = 20.0 # Default fallback
+            
+            vix_data = df_macro[df_macro['ticker'] == '^VIX'].sort_values('date')
+            if not vix_data.empty:
+                last_vix = vix_data.iloc[-1]['close']
+                
+            if last_vix > MACRO_PARAMS['VIX_PANIC_THRESHOLD']: # > 30
+                vix_score = -2
+            elif last_vix > MACRO_PARAMS['VIX_HIGH_THRESHOLD']: # > 25
+                vix_score = -1
+            elif last_vix < MACRO_PARAMS['VIX_LOW_THRESHOLD']: # < 15
+                vix_score = 1
+            else:
+                vix_score = 0
+                
+            # --- Yield Curve Score (10Y - 3M) ---
+            # 10Y-2Y is standard, but 10Y-3M is often considered more predictive by Fed.
+            # We use ^TNX (10Y) and ^IRX (13W).
+            yield_score = 0
+            
+            tnx_data = df_macro[df_macro['ticker'] == '^TNX'].sort_values('date')
+            irx_data = df_macro[df_macro['ticker'] == '^IRX'].sort_values('date')
+            
+            if not tnx_data.empty and not irx_data.empty:
+                t10 = tnx_data.iloc[-1]['close']
+                t3m = irx_data.iloc[-1]['close']
+                
+                # Check inversion
+                diff = t10 - t3m
+                if diff < MACRO_PARAMS['YIELD_CURVE_INVERSION_THRESHOLD']:
+                    yield_score = -1
+                elif diff > 0.5: # Healthy curve
+                    yield_score = 0 # Neutral/Normal. (Could be +1 if steepening, but keep simple)
+                    
+            # --- Total Macro Score ---
+            total_score = tech_score + vix_score + yield_score
+            
+            # Map to Regime
+            # Range: 
+            # Max: +1 (Tech) + 1 (Vix) + 0 (Yield) = +2
+            # Min: -1 (Tech) - 2 (Vix) - 1 (Yield) = -4
+            
+            regime = 'NEUTRAL'
+            
+            if total_score >= 1:
+                regime = 'STRONG_BULL'
+            elif total_score == 0:
+                regime = 'NEUTRAL' # or Weak Bull
+            elif total_score >= -2:
+                regime = 'CORRECTION'
+            else:
+                regime = 'CRISIS' # <= -3
+                
+            # Fallback for "BULL" in config if needed, but our new config has specific keys.
+            # If mapped key doesn't exist in config, fallback to closest.
+            
+            diff_display = f"{diff:.2f}" if 'diff' in locals() else "N/A"
+            logger.info(f"🧩 Macro Awareness: Score={total_score} (Tech:{tech_score}, VIX:{last_vix:.1f}, YieldDiff:{diff_display}) -> {regime}")
+            
+            return regime
+
         except Exception as e:
             logger.error(f"Regime detection failed: {e}")
             return 'NEUTRAL'
@@ -210,15 +286,20 @@ class FactorEngine:
                 'WEIGHT_LOW_VOL': FACTOR_PARAMS['WEIGHT_LOW_VOL']
             }
             
+        # [Cache Check]
+        if analysis_date in self._score_cache:
+            # logger.debug(f"⚡ Cache Hit: {analysis_date}")
+            return self._score_cache[analysis_date].copy()
+
         logger.info(f"Running Fama-French Regression for {analysis_date}...")
         
         # 1. Load Data
         df_price, df_fund = self._get_historical_data(analysis_date)
         
-        logger.warning(f"DEBUG: {analysis_date} | Price Rows: {len(df_price)} | Fund Rows: {len(df_fund)}")
+        logger.debug(f"DEBUG: {analysis_date} | Price Rows: {len(df_price)} | Fund Rows: {len(df_fund)}")
         
         if df_price.empty: 
-            logger.warning("DEBUG: df_price is empty!")
+            logger.debug("DEBUG: df_price is empty!")
             return pd.DataFrame()
         
         # 2. Pivot Price & Volume
@@ -263,10 +344,10 @@ class FactorEngine:
             return pd.DataFrame()
             
         # DEBUG PRINTS
-        logger.warning(f"DEBUG: df_returns shape: {df_returns.shape}")
-        logger.warning(f"DEBUG: df_fund shape: {df_fund.shape}")
+        logger.debug(f"DEBUG: df_returns shape: {df_returns.shape}")
+        logger.debug(f"DEBUG: df_fund shape: {df_fund.shape}")
         if not df_fund.empty:
-            logger.warning(f"DEBUG: df_fund sample ticker: {df_fund.iloc[0]['ticker']}")
+            logger.debug(f"DEBUG: df_fund sample ticker: {df_fund.iloc[0]['ticker']}")
 
         # 2.5 Prepare RFR
         # Dynamic Risk Free Rate Logic
@@ -282,9 +363,9 @@ class FactorEngine:
         # 3. Construct 6 Factors
         factors = self._construct_factors(df_returns, df_fund, rfr_series)
         
-        logger.warning(f"DEBUG: Factors shape: {factors.shape}")
+        logger.debug(f"DEBUG: Factors shape: {factors.shape}")
         if factors.empty: 
-            logger.warning("DEBUG: Factors construction returned empty.")
+            logger.debug("DEBUG: Factors construction returned empty.")
             return pd.DataFrame()
         
         # Align
@@ -411,11 +492,20 @@ class FactorEngine:
         w_quality = weights['WEIGHT_QUALITY']
         w_vol = weights['WEIGHT_LOW_VOL']
         
+        # [MODIFIED] Store Raw Z-Scores for External Optimization
+        df_res['z_alpha'] = z_alpha
+        df_res['z_quality'] = z_quality
+        df_res['z_low_vol'] = z_low_vol
+        
         df_res['final_score'] = (z_alpha * w_alpha) + (z_quality * w_quality) + (z_low_vol * w_vol)
         
         df_res.sort_values('final_score', ascending=False, inplace=True)
         
         logger.info(f"Scoring Complete. Top: {df_res.index[0]} (Score: {df_res.iloc[0]['final_score']:.2f} | Alpha: {df_res.iloc[0]['alpha']:.2%})")
+        
+        # [Cache Save]
+        self._score_cache[analysis_date] = df_res.copy()
+        
         return df_res
 
     def get_scored_universe(self, analysis_date=None, top_n=None):

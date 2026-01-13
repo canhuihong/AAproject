@@ -5,9 +5,15 @@ import time
 from tqdm import tqdm
 import logging
 import requests
+import sys
 import os
 import random
 from io import StringIO
+
+# 强制 UTF-8 输出
+if sys.stdout.encoding.lower() != 'utf-8':
+    sys.stdout.reconfigure(encoding='utf-8')
+
 
 # 引入配置
 # 确保你的 src/config.py 里已经有了 SP500_LIMIT, SP600_LIMIT 这些定义
@@ -370,12 +376,19 @@ def main():
     if spy_status == 1: print("✅ SPY Data Updated.")
     else: print("⏭️  SPY Skipped or Failed.")
 
+    # 3. 抓取正股名单
     # 2.1 强制检查 Risk Free Rate (^IRX)
     print("\n-------- Checking Risk Free Rate (^IRX) --------")
     rfr_status = process_single_stock(RFR_TICKER, db, existing_map.get(RFR_TICKER), is_benchmark=True)
     if rfr_status == 1: print("✅ RFR Data Updated.")
 
-    # 3. 抓取正股名单
+    # 2.2 强制检查 Macro Indicators (^VIX, ^TNX)
+    print("\n-------- Checking Macro Indicators (^VIX, ^TNX) --------")
+    macro_tickers = ['^VIX', '^TNX']
+    for mt in macro_tickers:
+         status = process_single_stock(mt, db, existing_map.get(mt), is_benchmark=True)
+         if status == 1: print(f"✅ {mt} Updated.")
+         else: print(f"⏭️  {mt} Skipped or Failed.")
     sp500_raw = get_tickers_from_wiki("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", "S&P 500")
     if SP500_LIMIT is not None:
         print(f"🚧 Test Mode: Limiting S&P 500 to first {SP500_LIMIT} stocks.")

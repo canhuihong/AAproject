@@ -121,10 +121,10 @@ if __name__ == "__main__":
 # 集中管理策略参数，方便调优
 BACKTEST_CONFIG = {
     'INITIAL_CAPITAL': 100000.0,
-    'START_DATE': '2021-12-01',
+    'START_DATE': '2021-01-01',
     'TRANSACTION_COST': 0.001,  # 双边各千分之一 (10 bps)
     'MAX_POSITION_WEIGHT': 0.10, # 单只股票最大仓位 10%
-    'REBALANCE_FREQ': 'M',      # 调仓频率 (M=Month, W=Week)
+    'REBALANCE_FREQ': 'Q',      # 调仓频率 (M=Month, Q=Quarter)
 }
 
 # ==========================================
@@ -162,7 +162,9 @@ STRATEGY_PARAMS = {
     'REGIME_SWITCHING': True,      # 启用动态择时
     'ENABLE_BUFFER': True,         # 启用缓冲区规则 (Hysteresis)
     'BUFFER_BUY_RANK': 15,         # 严进: 排名前15才买
-    'BUFFER_SELL_RANK': 25         # 宽出: (调优) 从30收窄到25，加速淘汰弱势股
+    'BUFFER_SELL_RANK': 25,        # 宽出: (调优) 从30收窄到25，加速淘汰弱势股
+    'ENABLE_STOP_LOSS': True,      # 启用动态止损
+    'STOP_LOSS_PCT': 0.20          # 20% 移动止损 (放宽以减少震荡磨损)
 }
 
 # ==========================================
@@ -173,20 +175,61 @@ LIQUIDITY_PARAMS = {
     'MIN_DOLLAR_VOLUME': 5000000   # 最低日均成交额 ($5M)
 }
 
+# ==========================================
+# 13. 宏观感知参数 (Macro Awareness)
+# ==========================================
+MACRO_PARAMS = {
+    'VIX_PANIC_THRESHOLD': 30,         # 恐慌阈值
+    'VIX_HIGH_THRESHOLD': 25,          # 高波动阈值
+    'VIX_LOW_THRESHOLD': 15,           # 低波动（安逸）阈值
+    'YIELD_CURVE_INVERSION_THRESHOLD': 0.0 # 倒挂阈值
+}
+
 REGIME_WEIGHTS = {
-    'BULL': { # 牛市 (SPY > SMA200) -> 进攻
+    # --- Bullish Regimes ---
+    # 强牛 (Strong Bull): VIX低 + 均线向上 + 经济正常
+    # 策略: 极度激进，满仓 Alpha
+    'STRONG_BULL': {
         'WEIGHT_ALPHA': 0.8,
-        'WEIGHT_QUALITY': 0.2, 
-        'WEIGHT_LOW_VOL': 0.0
+        'WEIGHT_QUALITY': 0.1, 
+        'WEIGHT_LOW_VOL': 0.1
     },
-    'BEAR': { # 熊市 (SPY < SMA200) -> 防守
-        'WEIGHT_ALPHA': 0.0,
-        'WEIGHT_QUALITY': 0.5,
-        'WEIGHT_LOW_VOL': 0.5
+
+    # 普通牛/弱牛 (Neutral/Weak Bull): 类似原始定义的 Bull
+    # 策略: 均衡偏进攻
+    'BULL': {
+        'WEIGHT_ALPHA': 0.6,
+        'WEIGHT_QUALITY': 0.3, 
+        'WEIGHT_LOW_VOL': 0.1
     },
-    'NEUTRAL': { # 震荡/默认
-        'WEIGHT_ALPHA': 0.5,
-        'WEIGHT_QUALITY': 0.3,
+    'NEUTRAL': {
+        'WEIGHT_ALPHA': 0.4,
+        'WEIGHT_QUALITY': 0.4,
         'WEIGHT_LOW_VOL': 0.2
+    },
+    
+    # --- Bearish Regimes ---
+    # 震荡/回调 (Correction): 高波 or 均线破位
+    # 策略: 防守，侧重 Quality (抗跌)
+    'CORRECTION': {
+        'WEIGHT_ALPHA': 0.2,
+        'WEIGHT_QUALITY': 0.5,
+        'WEIGHT_LOW_VOL': 0.3
+    },
+
+    # 危机模式 (Crisis): VIX 爆表
+    # 策略: 生存模式，丢弃 Alpha，全仓防御
+    # 注: 配合 optimizer 可能会进一步降低总仓位 (Hold Cash)
+    'CRISIS': {
+        'WEIGHT_ALPHA': 0.0,
+        'WEIGHT_QUALITY': 0.4,
+        'WEIGHT_LOW_VOL': 0.6
+    },
+    
+    # 兼容旧逻辑的 Fallback
+    'BEAR': {
+        'WEIGHT_ALPHA': 0.0,
+        'WEIGHT_QUALITY': 0.6,
+        'WEIGHT_LOW_VOL': 0.4
     }
 }

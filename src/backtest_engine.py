@@ -15,6 +15,7 @@ class BacktestEngine:
         self.start_date = pd.to_datetime(start_date or BACKTEST_CONFIG['START_DATE'])
         self.initial_capital = initial_capital or BACKTEST_CONFIG['INITIAL_CAPITAL']
         self.transaction_cost = transaction_cost or BACKTEST_CONFIG['TRANSACTION_COST']
+        self.rebalance_freq = BACKTEST_CONFIG.get('REBALANCE_FREQ', 'M')
         self.db = DataManager()
         self.factor_engine = FactorEngine()
         
@@ -42,8 +43,8 @@ class BacktestEngine:
             logger.warning(f"No dates found after start_date {self.start_date}")
             return []
             
-        # 取每个月最后一天
-        rebalance_dates = valid_dates.groupby(valid_dates.dt.to_period('M')).max()
+        # 取每个周期的最后一天
+        rebalance_dates = valid_dates.groupby(valid_dates.dt.to_period(self.rebalance_freq)).max()
         return rebalance_dates.sort_values().tolist()
 
     def _get_period_price_data(self, tickers, start_date, end_date):
@@ -127,6 +128,48 @@ class BacktestEngine:
         final_list = [x['ticker'] for x in candidates[:target_size]]
         
         return final_list
+
+    def _apply_stop_loss(self, normalized_prices):
+        """
+        Apply Intra-month Trailing Stop Loss.
+        If a stock drops > STOP_LOSS_PCT from its high *within this period*, 
+        we simulate selling it at that price and holding cash for the rest of the period.
+        """
+        if not STRATEGY_PARAMS.get('ENABLE_STOP_LOSS', False):
+            return normalized_prices
+            
+        stop_pct = STRATEGY_PARAMS['STOP_LOSS_PCT']
+        
+        # Calculate Drawdown from Running Max
+        running_max = normalized_prices.cummax()
+        drawdown = normalized_prices / running_max - 1
+        
+        # Identify stop trigger points
+        # shape: (T, N) boolean mask
+        stop_mask = drawdown < -stop_pct
+        
+        # We want to find the FIRST time it triggers for each stock
+        # idxmax returns the index of the first True
+        # but we need to check if there is ANY True
+        
+        modified_prices = normalized_prices.copy()
+        
+        for col in normalized_prices.columns:
+            if stop_mask[col].any():
+                # Get the first date where stop was triggered
+                first_stop_date = stop_mask[col].idxmax()
+                
+                # Get exit price (the price at that trigger moment)
+                exit_price = normalized_prices.loc[first_stop_date, col]
+                
+                # Lock the price at exit_price from that date onwards
+                # (Simulating holding cash)
+                modified_prices.loc[first_stop_date:, col] = exit_price
+                
+                # Log (optional, avoid spam)
+                # logger.debug(f"🛑 Trailing Stop Triggered: {col} on {first_stop_date.date()} at {exit_price:.2f}")
+                
+        return modified_prices
 
     def run(self):
         rebalance_dates = self.get_rebalance_schedule()
@@ -262,6 +305,9 @@ class BacktestEngine:
                 start_prices = period_prices.iloc[0]
 
             normalized_prices = period_prices / start_prices
+            
+            # [MODIFIED] Apply Stop Loss
+            normalized_prices = self._apply_stop_loss(normalized_prices)
             
             # 每日组合价值
             period_portfolio_value = (normalized_prices * valid_weights).sum(axis=1) * current_capital

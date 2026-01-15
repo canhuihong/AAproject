@@ -94,8 +94,8 @@ IB_CLIENT_ID = int(os.getenv("IB_CLIENT_ID", 1))
 # ==========================================
 # 设置每次下载的股票数量上限 (测试用)
 # ⚠️ 注意：正式全量运行时，请将这两个值设为 None
-SP500_LIMIT = None   # 测试模式：只下 50 只
-SP600_LIMIT = None   # 测试模式：只下 50 只
+SP500_LIMIT = None   # 大盘股
+SP600_LIMIT = None   # 小盘股
 SP400_LIMIT = None   # 中盘股
 NASDAQ_LIMIT = None  # 科技股
 
@@ -125,6 +125,7 @@ BACKTEST_CONFIG = {
     'TRANSACTION_COST': 0.001,  # 双边各千分之一 (10 bps)
     'MAX_POSITION_WEIGHT': 0.10, # 单只股票最大仓位 10%
     'REBALANCE_FREQ': 'Q',      # 调仓频率 (M=Month, Q=Quarter)
+    'PORTFOLIO_SIZE': 20        # Reverted to 20
 }
 
 # ==========================================
@@ -144,13 +145,31 @@ FACTOR_PARAMS = {
 }
 
 # ==========================================
-# 10. 优化器参数 (Optimizer)
+# 10. 成本与滑点参数 (Cost & Slippage)
+# ==========================================
+SLIPPAGE_PARAMS = {
+    'ENABLE': True,
+    'BASE_SPREAD': 0.0005,    # 基础点差 (5bps)
+    'IMPACT_K': 0.1           # 冲击系数 (Square Root Law)
+}
+
+# ==========================================
+# 10.5 换手率控制 (Turnover Control)
+# ==========================================
+TURNOVER_PARAMS = {
+    'ENABLE': True,
+    'TRADE_THRESHOLD': 0.05   # 交易门槛 (5%): 变动小于5%的直接忽略 (降低换手)
+}
+
+# ==========================================
+# 11. 优化器参数 (Optimizer)
 # ==========================================
 OPTIMIZER_PARAMS = {
     'MAX_ASSET_WEIGHT': 0.10,      # 单个资产上限
     'MAX_SECTOR_WEIGHT': 0.30,     # 单行业上限
     'MIN_HISTORY_DAYS': 60,        # 最小历史 (Valid history)
-    'RISK_FREE_RATE': 0.04         # 默认无风险利率 (Fallback)
+    'RISK_FREE_RATE': 0.04,        # 默认无风险利率 (Fallback)
+    'USE_HRP': True               # 是否使用 HRP 优化 (Hierarchical Risk Parity)
 }
 
 # ==========================================
@@ -158,13 +177,13 @@ OPTIMIZER_PARAMS = {
 # ==========================================
 STRATEGY_PARAMS = {
     'ENABLE_SMOOTHING': True,      # 启用信号平滑
-    'SMOOTHING_MONTHS': 3,         # 平滑窗口 (3个月)
+    'SMOOTHING_MONTHS': 6,         # 平滑窗口 (3个月)
     'REGIME_SWITCHING': True,      # 启用动态择时
     'ENABLE_BUFFER': True,         # 启用缓冲区规则 (Hysteresis)
     'BUFFER_BUY_RANK': 15,         # 严进: 排名前15才买
-    'BUFFER_SELL_RANK': 25,        # 宽出: (调优) 从30收窄到25，加速淘汰弱势股
-    'ENABLE_STOP_LOSS': True,      # 启用动态止损
-    'STOP_LOSS_PCT': 0.20          # 20% 移动止损 (放宽以减少震荡磨损)
+    'BUFFER_SELL_RANK': 35,        # 宽出: (调优) 放宽到35，拿住好股票 (Reverted)
+    'ENABLE_STOP_LOSS': False,      # 启用动态止损
+    'STOP_LOSS_PCT': 0.25          # 25% 移动止损
 }
 
 # ==========================================

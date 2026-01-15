@@ -51,8 +51,9 @@ def run_live_mode(report):
         report.add_text(msg)
         return
 
-    # 选 Top 20 (Diversified)
-    top_picks = scored_df.head(20)
+    # 选 Top N (Diversified)
+    target_size = BACKTEST_CONFIG.get('PORTFOLIO_SIZE', 20)
+    top_picks = scored_df.head(target_size)
     top_tickers = top_picks.index.tolist()
     
     # 1. 保存打分结果

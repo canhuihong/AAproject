@@ -113,8 +113,10 @@ class FactorEngine:
             
             regime = 'NEUTRAL'
             
-            if total_score >= 1:
-                regime = 'STRONG_BULL'
+            if total_score >= 2:
+                regime = 'STRONG_BULL' # Tech(1) + Vix(1) = 2. Requires BOTH.
+            elif total_score >= 1:
+                regime = 'BULL' # Tech(1) or Vix(1). One is enough.
             elif total_score == 0:
                 regime = 'NEUTRAL' # or Weak Bull
             elif total_score >= -2:
@@ -143,11 +145,29 @@ class FactorEngine:
         start_date = (pd.Timestamp(analysis_date) - pd.Timedelta(days=self.lookback_days * 2)).strftime('%Y-%m-%d')
         query_prices = f"SELECT date, ticker, close, volume FROM prices WHERE date >= '{start_date}' AND date <= '{analysis_date}'"
         
-        # 2. Get Fundamentals (for SMB/HML construction + Accruals)
+        # 2. Get Fundamentals (for SMB/HML construction + Accruals + Piotroski + FCF)
         # We need the latest snapshot relative to analysis_date
-        # Fix: Ensure we don't pick up "hollow" rows (shares update only) that have NULL financials
+        
+        # [Factor 2.0] Fetch Current + Lagged (1 Year Ago)
+        import datetime
+        dt_curr = datetime.datetime.strptime(analysis_date, '%Y-%m-%d')
+        dt_prev = dt_curr - datetime.timedelta(days=365)
+        prev_date_str = dt_prev.strftime('%Y-%m-%d')
+
         query_fund = f"""
-            SELECT f.ticker, f.total_equity, f.shares_count, f.net_income, f.total_revenue, f.total_assets, f.operating_cash_flow
+            SELECT 
+                f.ticker, 
+                f.total_equity, f.shares_count, f.net_income, f.total_revenue, f.total_assets, f.operating_cash_flow,
+                f.long_term_debt, f.total_current_assets, f.total_current_liabilities, f.gross_profit, f.capital_expenditure,
+                prev.net_income as prev_net_income,
+                prev.total_assets as prev_total_assets,
+                prev.long_term_debt as prev_long_term_debt,
+                prev.total_current_assets as prev_total_current_assets,
+                prev.total_current_liabilities as prev_total_current_liabilities,
+                prev.shares_count as prev_shares_count,
+                prev.gross_profit as prev_gross_profit,
+                prev.total_revenue as prev_total_revenue,
+                (f.operating_cash_flow / f.total_assets) as roa_cfo -- Pre-calc logic hint
             FROM fundamentals f
             INNER JOIN (
                 SELECT ticker, MAX(date) as max_date
@@ -155,6 +175,20 @@ class FactorEngine:
                 WHERE date <= '{analysis_date}' AND total_equity IS NOT NULL AND net_income IS NOT NULL
                 GROUP BY ticker
             ) latest ON f.ticker = latest.ticker AND f.date = latest.max_date
+            
+            LEFT JOIN (
+                SELECT 
+                    f_prev.ticker, f_prev.net_income, f_prev.total_assets, f_prev.long_term_debt, 
+                    f_prev.total_current_assets, f_prev.total_current_liabilities, f_prev.shares_count,
+                    f_prev.gross_profit, f_prev.total_revenue
+                FROM fundamentals f_prev
+                INNER JOIN (
+                    SELECT ticker, MAX(date) as max_date
+                    FROM fundamentals
+                    WHERE date <= '{prev_date_str}'
+                    GROUP BY ticker
+                ) latest_prev ON f_prev.ticker = latest_prev.ticker AND f_prev.date = latest_prev.max_date
+            ) prev ON f.ticker = prev.ticker
         """
         
         try:
@@ -472,6 +506,61 @@ class FactorEngine:
             
         df_res['accruals'] = accruals
         
+        # [Factor 2.0] Piotroski F-Score (0-9)
+        # We use fillna(0) to be safe for missing data (conservative score)
+        try:
+            # 1. ROA > 0
+            score_roa = ((valid_fund['net_income'] / valid_fund['total_assets']) > 0).astype(int)
+            
+            # 2. CFO > 0
+            score_cfo = (valid_fund['operating_cash_flow'] > 0).astype(int)
+            
+            # 3. Delta ROA > 0 (vs Prev Year)
+            curr_roa = valid_fund['net_income'] / valid_fund['total_assets']
+            prev_roa = valid_fund['prev_net_income'] / valid_fund['prev_total_assets']
+            score_delta_roa = (curr_roa > prev_roa).astype(int)
+            
+            # 4. Accrual (CFO > NI) - Quality of Earnings
+            score_accrual = (valid_fund['operating_cash_flow'] > valid_fund['net_income']).astype(int)
+            
+            # 5. Delta Leverage (LTD / Assets < Prev)
+            curr_lev = valid_fund['long_term_debt'] / valid_fund['total_assets']
+            prev_lev = valid_fund['prev_long_term_debt'] / valid_fund['prev_total_assets']
+            score_lev = (curr_lev < prev_lev).astype(int)
+            
+            # 6. Delta Current Ratio (CA / CL > Prev)
+            curr_cr = valid_fund['total_current_assets'] / valid_fund['total_current_liabilities']
+            prev_cr = valid_fund['prev_total_current_assets'] / valid_fund['prev_total_current_liabilities']
+            score_cr = (curr_cr > prev_cr).astype(int)
+            
+            # 7. Delta Shares (Dilution <= 0)
+            score_shares = (valid_fund['shares_count'] <= valid_fund['prev_shares_count']).astype(int)
+            
+            # 8. Delta Gross Margin (GP / Rev > Prev)
+            curr_gm = valid_fund['gross_profit'] / valid_fund['total_revenue']
+            prev_gm = valid_fund['prev_gross_profit'] / valid_fund['prev_total_revenue']
+            score_gm = (curr_gm > prev_gm).astype(int)
+            
+            # 9. Delta Turnover (Rev / Assets > Prev)
+            curr_at = valid_fund['total_revenue'] / valid_fund['total_assets']
+            prev_at = valid_fund['prev_total_revenue'] / valid_fund['prev_total_assets']
+            score_at = (curr_at > prev_at).astype(int)
+            
+            df_res['piotroski'] = score_roa + score_cfo + score_delta_roa + score_accrual + score_lev + score_cr + score_shares + score_gm + score_at
+            
+        except Exception as e:
+            # logger.warning(f"Piotroski Calc Failed: {e}")
+            df_res['piotroski'] = 5 # Neutral default
+            
+        # [Factor 2.0] FCF Yield (Value)
+        try:
+            fcf = valid_fund['operating_cash_flow'] - valid_fund['capital_expenditure']
+            mkt_cap = valid_fund['shares_count'] * df_res['close']
+            df_res['fcf_yield'] = fcf / mkt_cap
+            df_res['fcf_yield'] = df_res['fcf_yield'].replace([np.inf, -np.inf], 0).fillna(0)
+        except Exception:
+            df_res['fcf_yield'] = 0.0
+        
         # B. Z-Score Standardization (Robust to scale differences)
         
         # Helper: Rank and Z-Score (Percentile might be better but Z-score is standard)
@@ -485,7 +574,23 @@ class FactorEngine:
         
         # For Volatility and Accruals, LOWER is BETTER. So we negate them.
         z_low_vol = robust_zscore(df_res['volatility']) * -1.0
-        z_quality = robust_zscore(df_res['accruals']) * -1.0 
+        z_accruals = robust_zscore(df_res['accruals']) * -1.0 
+        
+        # [Factor 2.0] New Z-Scores
+        z_piotroski = robust_zscore(df_res['piotroski']) # Higher Better
+        z_fcf_yield = robust_zscore(df_res['fcf_yield']) # Higher Better
+
+        # Unified Quality Score: Avg(Piotroski, Low Accruals)
+        z_quality_combined = (z_piotroski + z_accruals) / 2.0
+        
+        # Unified Value/Alpha Score: We mix FCF Yield into Alpha/Quality?
+        # Let's keep existing weights structure but replace 'quality' component with 'quality_combined'
+        # And maybe give a slight boost to FCF Yield in the final Mix if we want Value exposure.
+        # Decision: Use Enhanced Quality. Leave Alpha as Pure Alpha.
+        # But add FCF Yield as a bonus "Value Kicker"?
+        # Let's just fold FCF Yield into Quality for now (Quality often includes Cash Generation).
+        
+        z_quality_final = (z_piotroski + z_accruals + z_fcf_yield) / 3.0 
         
         # C. Weighted Sum
         w_alpha = weights['WEIGHT_ALPHA']
@@ -494,10 +599,10 @@ class FactorEngine:
         
         # [MODIFIED] Store Raw Z-Scores for External Optimization
         df_res['z_alpha'] = z_alpha
-        df_res['z_quality'] = z_quality
+        df_res['z_quality'] = z_quality_final
         df_res['z_low_vol'] = z_low_vol
         
-        df_res['final_score'] = (z_alpha * w_alpha) + (z_quality * w_quality) + (z_low_vol * w_vol)
+        df_res['final_score'] = (z_alpha * w_alpha) + (z_quality_final * w_quality) + (z_low_vol * w_vol)
         
         df_res.sort_values('final_score', ascending=False, inplace=True)
         

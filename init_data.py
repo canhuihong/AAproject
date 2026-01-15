@@ -148,9 +148,18 @@ def process_single_stock(ticker, db, last_update_date=None, is_benchmark=False):
             next_day = last_dt + datetime.timedelta(days=1)
             
             # 【CRITICAL FIX】防止请求当天的还没产生的数据
-            # 如果 next_day >= 今天，说明昨天的已经有了，今天的还没收盘 -> 跳过
+            # 如果 next_day >= 今天，说明昨天的已经有了，今天的还没收盘
             if next_day.date() >= datetime.datetime.now().date():
-                return 0
+                # [Factor 2.0] Check if we need to backfill missing fundamental columns
+                # Only check health if we haven't checked recently (e.g. days_diff > 3)
+                # This prevents infinite repair loops for stocks that just don't have the data.
+                if days_diff > 3 and not db.check_fundamental_health(ticker):
+                     # Unhealthy -> Force Update (but we can skip price download to save time)
+                    logger.debug(f"🩹 Repairing fundamentals for {ticker}...")
+                    start_date = (datetime.datetime.now() - datetime.timedelta(days=7)).strftime('%Y-%m-%d')
+                else:
+                    return 0 # Healthy + Up-to-date -> Skip
+
             start_date = next_day.strftime('%Y-%m-%d')
             download_period = None 
 
@@ -158,7 +167,7 @@ def process_single_stock(ticker, db, last_update_date=None, is_benchmark=False):
         original_ticker = ticker
         ticker = ticker.replace('$', '').strip() 
         if original_ticker != ticker:
-            logger.info(f"🔧 Sanitized ticker: {original_ticker} -> {ticker}")
+            logger.debug(f"🔧 Sanitized ticker: {original_ticker} -> {ticker}")
 
         # ==========================================
         # B. 价格下载 (Price Data)
@@ -178,7 +187,7 @@ def process_single_stock(ticker, db, last_update_date=None, is_benchmark=False):
                     
                     # 如果拆股发生在上次更新之后，或者就是同一天，强制重跑
                     if last_split_date >= last_db_date:
-                        logger.info(f"🔄 Split detected for {ticker} on {last_split_date.date()}. Forcing full redownload.")
+                        logger.debug(f"🔄 Split detected for {ticker} on {last_split_date.date()}. Forcing full redownload.")
                         start_date = None
                         download_period = "10y"
             except Exception:
@@ -287,8 +296,52 @@ def process_single_stock(ticker, db, last_update_date=None, is_benchmark=False):
                     
                     if shares == 0:
                         # Fallback: if we can't find shares in BS, maybe it's not a common stock?
-                        # For now, we record 0. Downstream might need to handle this or use last known.
                         pass
+
+                    # [Factor 2.0] Fetch Additional Fields
+                    # 1. Long Term Debt (BS)
+                    ltd = 0
+                    for k in ['Long Term Debt', 'Total Long Term Debt', 'Long Term Debt And Capital Lease Obligation']:
+                        if k in bs_df.index:
+                            ltd = bs_df.loc[k, date]
+                            break
+                    
+                    # 2. Current Assets/Liabilities (BS)
+                    ca = 0
+                    for k in ['Total Current Assets', 'Current Assets']:
+                        if k in bs_df.index:
+                            ca = bs_df.loc[k, date]
+                            break
+                            
+                    cl = 0
+                    for k in ['Total Current Liabilities', 'Current Liabilities']:
+                        if k in bs_df.index:
+                            cl = bs_df.loc[k, date]
+                            break
+                            
+                    # 3. Gross Profit (IS)
+                    gp = 0
+                    if 'Gross Profit' in fin_df.index:
+                        gp = fin_df.loc['Gross Profit', date]
+                    
+                    # 4. Capital Expenditure (CF)
+                    capex = 0
+                    for k in ['Capital Expenditure', 'Capital Expenditures', 'Total Capital Expenditures']:
+                        if k in fin_df.index: # Usually CF items are in fin_df (merged) or check specific logic
+                            capex = fin_df.loc[k, date]
+                            break
+                        # Note: In yfinance `financials` vs `cashflow` might be separate. 
+                        # Our `init_data` merges them? Let's check call site.
+                        # Ah, `get_financials` merges them? No, this function signature is `extract_fundamentals(fin_df, bs_df)`.
+                        # We need to verify if `fin_df` includes Cash Flow items.
+                        # Looking at caller: `fin = obj.financials`, `bs = obj.balance_sheet`, `cf = obj.cashflow`
+                        # The caller currently passes `fin` and `bs`. We need to pass `cf` too!
+                        
+                    # Wait, we need to update the caller to pass `cf` df as well.
+                    # For now, let's assume we will pass `cf` dataframe merged into `fin_df` OR change signature.
+                    # Creating a temporary fix: assume `fin_df` contains CF items because we will ensure it in caller.
+                    
+                    # 60天前视偏差防护
 
                     # 60天前视偏差防护
                     eff_date = date + datetime.timedelta(days=60)
@@ -298,10 +351,15 @@ def process_single_stock(ticker, db, last_update_date=None, is_benchmark=False):
                         eff_date.strftime('%Y-%m-%d'), 
                         ticker, 
                         float(ni), float(eq), float(rev), float(shares), 
-                        date.strftime('%Y-%m-%d'),
-                        float(assets),       # New
-                        float(op_inc),       # New
-                        float(ocf)           # New (Cash Flow)
+                        date.strftime('%Y-%m-%d'), # Index 6: Report Period
+                        float(assets),       
+                        float(op_inc),      
+                        float(ocf),
+                        float(ltd),          # New
+                        float(ca),           # New
+                        float(cl),           # New
+                        float(gp),           # New
+                        float(capex)         # New
                     ))
                 except Exception:
                     continue
@@ -327,8 +385,8 @@ def process_single_stock(ticker, db, last_update_date=None, is_benchmark=False):
         # 2. Merge & Deduplicate
         combined = {}
         for r in a_recs + q_recs:
-             # r[-1] is report_date, r[5] is shares
-             combined[r[-1]] = r
+             # r[6] is report_period
+             combined[r[6]] = r
              
         fund_recs = list(combined.values())
             

@@ -43,6 +43,11 @@ class DataManager:
             total_assets REAL,    -- [FF5新增] 总资产 (用于 CMA)
             operating_income REAL,-- [FF5新增] 营业利润 (用于 RMW)
             operating_cash_flow REAL, -- [New] 经营性现金流 (用于 Accruals)
+            long_term_debt REAL,  -- [Factor2.0] 长期债务 (用于 Leverage Delta)
+            total_current_assets REAL, -- [Factor2.0] 流动资产 (用于 Current Ratio)
+            total_current_liabilities REAL, -- [Factor2.0] 流动负债
+            gross_profit REAL,    -- [Factor2.0] 毛利 (用于 Margin Delta)
+            capital_expenditure REAL, -- [Factor2.0] 资本开支 (用于 FCF)
             PRIMARY KEY (date, ticker)
         )
         ''')
@@ -57,13 +62,22 @@ class DataManager:
         )
         ''')
         
-        # 简单迁移逻辑：尝试添加新列 (如果不小心是旧库)
-        try:
-            cursor.execute("ALTER TABLE fundamentals ADD COLUMN total_assets REAL")
-            cursor.execute("ALTER TABLE fundamentals ADD COLUMN operating_income REAL")
-            cursor.execute("ALTER TABLE fundamentals ADD COLUMN operating_cash_flow REAL")
-        except:
-            pass # 已经存在或失败忽略
+        # 简单迁移逻辑：逐个尝试添加新列
+        migrations = [
+            "ALTER TABLE fundamentals ADD COLUMN total_assets REAL",
+            "ALTER TABLE fundamentals ADD COLUMN operating_income REAL",
+            "ALTER TABLE fundamentals ADD COLUMN operating_cash_flow REAL",
+            "ALTER TABLE fundamentals ADD COLUMN long_term_debt REAL",
+            "ALTER TABLE fundamentals ADD COLUMN total_current_assets REAL",
+            "ALTER TABLE fundamentals ADD COLUMN total_current_liabilities REAL",
+            "ALTER TABLE fundamentals ADD COLUMN gross_profit REAL",
+            "ALTER TABLE fundamentals ADD COLUMN capital_expenditure REAL"
+        ]
+        for sql in migrations:
+            try:
+                cursor.execute(sql)
+            except:
+                pass # 列已存在则忽略
 
         conn.commit()
         conn.close()
@@ -90,8 +104,10 @@ class DataManager:
         try:
             conn.executemany(
                 '''INSERT OR REPLACE INTO fundamentals 
-                   (date, ticker, net_income, total_equity, total_revenue, shares_count, report_period, total_assets, operating_income, operating_cash_flow) 
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                   (date, ticker, net_income, total_equity, total_revenue, shares_count, report_period, 
+                    total_assets, operating_income, operating_cash_flow,
+                    long_term_debt, total_current_assets, total_current_liabilities, gross_profit, capital_expenditure) 
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                 records
             )
             conn.commit()
@@ -142,7 +158,15 @@ class DataManager:
             f.net_income, 
             f.total_equity, 
             f.total_revenue,
-            f.shares_count
+            f.shares_count,
+            f.total_assets,
+            f.operating_income,
+            f.operating_cash_flow,
+            f.long_term_debt,
+            f.total_current_assets,
+            f.total_current_liabilities,
+            f.gross_profit,
+            f.capital_expenditure
         FROM fundamentals f
         INNER JOIN (
             SELECT ticker, MAX(date) as max_date
@@ -152,10 +176,45 @@ class DataManager:
         ) latest ON f.ticker = latest.ticker AND f.date = latest.max_date
         '''
         df_fund = pd.read_sql(fund_query, conn)
+        
+        # [Factor 2.0] Fetch Lagged Fundamentals (1 Year Ago) for Piotroski Delta
+        # Logic: Find latest report <= date_str - 365 days
+        import datetime
+        dt_curr = datetime.datetime.strptime(date_str, '%Y-%m-%d')
+        dt_prev = dt_curr - datetime.timedelta(days=365)
+        prev_date_str = dt_prev.strftime('%Y-%m-%d')
+        
+        prev_fund_query = f'''
+        SELECT 
+            f.ticker, 
+            f.net_income as prev_net_income, 
+            f.total_assets as prev_total_assets,
+            f.long_term_debt as prev_long_term_debt,
+            f.total_current_assets as prev_total_current_assets,
+            f.total_current_liabilities as prev_total_current_liabilities,
+            f.shares_count as prev_shares_count,
+            f.gross_profit as prev_gross_profit,
+            f.total_revenue as prev_total_revenue
+        FROM fundamentals f
+        INNER JOIN (
+            SELECT ticker, MAX(date) as max_date
+            FROM fundamentals
+            WHERE date <= '{prev_date_str}'
+            GROUP BY ticker
+        ) latest ON f.ticker = latest.ticker AND f.date = latest.max_date
+        '''
+        try:
+            df_prev = pd.read_sql(prev_fund_query, conn)
+        except Exception:
+            df_prev = pd.DataFrame()
+
         conn.close()
         
-        # 4. 合并返回
-        return pd.merge(df_price, df_fund, on='ticker', how='left')
+        # 4. Merge Current + Lagged
+        df_merged = pd.merge(df_fund, df_prev, on='ticker', how='left')
+        
+        # 5. Merge with Price
+        return pd.merge(df_price, df_merged, on='ticker', how='left')
 
     def save_stock_info(self, records):
         """批量保存股票板块信息 (records: list of tuples/dicts)"""
@@ -222,5 +281,31 @@ class DataManager:
         except Exception as e:
             logger.error(f"Failed to get RFR: {e}")
             return pd.Series(dtype=float)
+        finally:
+            conn.close()
+
+    def check_fundamental_health(self, ticker):
+        """
+        【新增】检查基本面数据是否完整 (Factor 2.0 迁移检查)
+        检查最新的一条记录，看新字段 (long_term_debt) 是否为空
+        Returns: True (Healthy), False (Needs Update)
+        """
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            # Fetch the latest report
+            cursor.execute(f"SELECT long_term_debt FROM fundamentals WHERE ticker = '{ticker}' ORDER BY date DESC LIMIT 1")
+            row = cursor.fetchone()
+            if not row:
+                return True # No data at all, nothing to 'fix' (or treat as healthy to avoid loop)
+                # Actually if no data, we might need download. But price update handles that.
+                # Here we care about EXISTING partial data.
+            
+            val = row[0]
+            if val is None:
+                return False # Missing new field!
+            return True
+        except Exception:
+            return True # Fallback
         finally:
             conn.close()

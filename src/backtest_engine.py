@@ -4,7 +4,7 @@ import logging
 from src.factor_engine import FactorEngine
 from src.optimizer import PortfolioOptimizer
 from src.data_manager import DataManager
-from src.config import BACKTEST_CONFIG, STRATEGY_PARAMS
+from src.config import BACKTEST_CONFIG, STRATEGY_PARAMS, SLIPPAGE_PARAMS, TURNOVER_PARAMS
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -46,6 +46,37 @@ class BacktestEngine:
         # 取每个周期的最后一天
         rebalance_dates = valid_dates.groupby(valid_dates.dt.to_period(self.rebalance_freq)).max()
         return rebalance_dates.sort_values().tolist()
+
+    def _get_avg_volumes(self, tickers, anchor_date):
+        """
+        Fetch 20-day average Dollar Volume for slippage calc.
+        Returns: dict {ticker: avg_dollar_volume}
+        """
+        if not tickers: return {}
+        
+        # Lookback 30 days to get ~20 trading days
+        start_dt = (anchor_date - pd.Timedelta(days=40)).strftime('%Y-%m-%d')
+        end_dt = anchor_date.strftime('%Y-%m-%d')
+        
+        conn = self.db._get_conn()
+        placeholders = ",".join([f"'{t}'" for t in tickers])
+        
+        # Calculate Avg(Close * Volume) directly in SQL
+        query = f"""
+            SELECT ticker, AVG(close * volume) as avg_dollar_vol
+            FROM prices
+            WHERE ticker IN ({placeholders})
+            AND date >= '{start_dt}' AND date <= '{end_dt}'
+            GROUP BY ticker
+        """
+        try:
+            df = pd.read_sql(query, conn)
+            return dict(zip(df['ticker'], df['avg_dollar_vol']))
+        except Exception as e:
+            logger.warning(f"Error fetching volumes: {e}")
+            return {}
+        finally:
+            conn.close()
 
     def _get_period_price_data(self, tickers, start_date, end_date):
         """
@@ -213,12 +244,17 @@ class BacktestEngine:
                 
             # [MODIFIED] Stock Selection with Buffer
             current_holdings = set(prev_weights.keys())
-            top_tickers = self._apply_buffer_rule(scored_df, current_holdings, target_size=20)
+            top_tickers = self._apply_buffer_rule(
+                scored_df, 
+                current_holdings, 
+                target_size=BACKTEST_CONFIG.get('PORTFOLIO_SIZE', 20)
+            )
             
             # --- 2. 优化权重 (Max 10%) ---
             try:
                 optimizer = PortfolioOptimizer(top_tickers, analysis_date=date_str)
-                allocation_df = optimizer.optimize_sharpe_ratio(max_weight=0.1)
+                # [MODIFIED] Use generic optimize_portfolio() to support HRP/MVO based on Config
+                allocation_df = optimizer.optimize_portfolio()
             except Exception as e:
                 logger.warning(f"   ⚠️ Optimizer crashed: {e}")
                 allocation_df = pd.DataFrame()
@@ -231,8 +267,45 @@ class BacktestEngine:
                 continue
 
             # 提取权重字典
-            weights = dict(zip(allocation_df['ticker'], allocation_df['weight']))
-            weights = {k: v for k, v in weights.items() if v > 0.001}
+            target_weights_df = dict(zip(allocation_df['ticker'], allocation_df['weight']))
+            
+            # [MODIFIED] Turnover Control (Lazy Trading)
+            # If (Enable and |New - Old| < Threshold) -> Keep Old
+            final_weights = {}
+            if TURNOVER_PARAMS['ENABLE']:
+                threshold = TURNOVER_PARAMS['TRADE_THRESHOLD']
+                all_involved = set(target_weights_df.keys()) | set(prev_weights.keys())
+                
+                temp_weights = {}
+                for t in all_involved:
+                    w_new = target_weights_df.get(t, 0)
+                    w_old = prev_weights.get(t, 0)
+                    diff = abs(w_new - w_old)
+                    
+                    # Lazy Rule: If stock is held and change is small, do nothing (keep old)
+                    # Note: If stock is NOT held (w_old=0), we only buy if w_new > threshold? 
+                    # Usually we want to avoid small buys too.
+                    
+                    if diff < threshold:
+                         # Keep old weight (effectively ignoring the optimization for this stock)
+                         if w_old > 0:
+                             temp_weights[t] = w_old
+                    else:
+                        # Accept new weight
+                        if w_new > 0:
+                            temp_weights[t] = w_new
+                            
+                # Renormalize 
+                total_w = sum(temp_weights.values())
+                if total_w > 0:
+                    for t in temp_weights:
+                        temp_weights[t] /= total_w  # Normalize to 1.0
+                
+                weights = temp_weights
+            else:
+                # Standard behavior
+                weights = {k: v for k, v in target_weights_df.items() if v > 0.001}
+
             active_tickers = list(weights.keys())
             
             if not active_tickers:
@@ -240,26 +313,57 @@ class BacktestEngine:
 
             logger.info(f"   ✅ Position: {len(active_tickers)} stocks (Top: {active_tickers[:3]}...)")
 
-            # --- 2.5 交易成本计算 ---
+            # --- 2.5 交易成本计算 (Dynamic Slippage) ---
             # Turnover = sum(|w_new - w_old|)
-            all_tickers = set(weights.keys()) | set(prev_weights.keys())
-            turnover = sum(abs(weights.get(t, 0) - prev_weights.get(t, 0)) for t in all_tickers)
+            all_tickers = list(set(weights.keys()) | set(prev_weights.keys()))
             
-            # Cost = Turnover * Cap * Rate
-            # 注意：这里的 turnover 是双边的总变动比例 (比如卖10%买10%，turnover=20%)
-            # 这里的 transaction_cost 如果是单边的 (比如 10bps)，那么对于买和卖都要收
-            # 所以 0.001 * 20% = 0.02% 的总资产
-            cost = turnover * val * self.transaction_cost if (val := current_capital) > 0 else 0
+            slippage_cost = 0.0
+            total_turnover = 0.0
             
-            # 首日建仓 (prev_weights为空) 也算 Turnover (即 100% 买入)
-            if not prev_weights:
-                # 初始建仓只算买入的一边成本?
-                # 通常 Backtest 假设初始资金是现金，所以是买入 100%，Turnover=100%
-                # Cost = 1.0 * cost_rate
-                pass
-
+            # Fetch Volume Data for Cost Calculation
+            # We use 20-day average volume to be robust
+            try:
+                vol_map = self._get_avg_volumes(all_tickers, curr_date)
+            except:
+                vol_map = {}
+            
+            for t in all_tickers:
+                w_new = weights.get(t, 0)
+                w_old = prev_weights.get(t, 0)
+                delta_w = abs(w_new - w_old)
+                
+                if delta_w < 1e-5: continue
+                
+                total_turnover += delta_w
+                
+                # Trade Value ($)
+                trade_val = delta_w * current_capital
+                
+                # Dynamic Slippage Model
+                # Cost = Commission + Impact
+                # Impact = Base + K * sqrt(TradeVal / DailyVol)
+                
+                impact_bps = 0
+                if SLIPPAGE_PARAMS['ENABLE']:
+                    # Note: DB volume is usually shares. We need $ volume.
+                    # We calculated avg_dollar_vol in SQL directly
+                    avg_dollar_vol = vol_map.get(t, 10000000) # Default $10M if missing
+                    
+                    if avg_dollar_vol > 0:
+                        participation_rate = trade_val / avg_dollar_vol
+                    else:
+                        participation_rate = 1.0 # High impact
+                        
+                    impact_bps = SLIPPAGE_PARAMS['BASE_SPREAD'] + SLIPPAGE_PARAMS['IMPACT_K'] * np.sqrt(participation_rate)
+                
+                # Total Rate
+                total_rate = self.transaction_cost + impact_bps
+                slippage_cost += trade_val * total_rate
+            
+            cost = slippage_cost
             current_capital -= cost
-            logger.info(f"   💸 Cost: ${cost:.2f} (Turnover: {turnover:.1%}) -> Net Cap: ${current_capital:,.0f}")
+            
+            logger.info(f"   💸 Cost: ${cost:.2f} (Turnover: {total_turnover:.1%}) -> Net Cap: ${current_capital:,.0f}")
             
             # 更新 prev_weights
             prev_weights = weights

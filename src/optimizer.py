@@ -1,7 +1,10 @@
-import numpy as np
-import pandas as pd
-from scipy.optimize import minimize
 import logging
+import pandas as pd
+import numpy as np
+import scipy.optimize as sco
+from scipy.optimize import minimize
+import scipy.cluster.hierarchy as sch
+import scipy.spatial.distance as ssd
 from src.data_manager import DataManager
 
 from src.config import OPTIMIZER_PARAMS, logger as global_logger
@@ -203,6 +206,108 @@ class PortfolioOptimizer:
         except Exception as e:
             logger.error(f"Optimization crashed ({e}). Fallback to Equal Weights.")
             return self._get_equal_weights(self.valid_tickers)
+
+    def optimize_portfolio(self):
+        """
+        Generic entry point. Dispatches to HRP or Sharpe based on Config.
+        """
+        if OPTIMIZER_PARAMS.get('USE_HRP', False):
+            logger.info("🧠 Optimization Mode: HRP (Hierarchical Risk Parity)")
+            return self.optimize_hrp()
+        else:
+            logger.info("🧠 Optimization Mode: MVO (Max Sharpe)")
+            return self.optimize_sharpe_ratio()
+
+    # ==========================================
+    # HRP Implementation
+    # ==========================================
+    def optimize_hrp(self):
+        if self.data.empty or not self.valid_tickers:
+            return self._get_equal_weights(self.tickers)
+
+        try:
+            # 1. Prepare Data
+            returns = self.data.pct_change().dropna()
+            if returns.empty: return self._get_equal_weights(self.valid_tickers)
+            
+            cov = returns.cov()
+            corr = returns.corr()
+            
+            # 2. Clustering
+            dist = ssd.pdist(corr, metric='euclidean') # Or correlation distance (1-corr)
+            # More standard HRP uses (1-corr) as distance *matrix* then condensed?
+            # Lopez de Prado uses: d[i,j] = sqrt(0.5 * (1 - rho[i,j])) ? 
+            # Simplified: Use Euclidean distance of correlation matrix rows
+            link = sch.linkage(dist, method='single')
+            
+            # 3. Quasi Diagonalization (Sort)
+            sort_ix = self._get_quasi_diag(link)
+            sort_ix = [self.valid_tickers[i] for i in sort_ix] # Map index to ticker
+            
+            # Reorder cov/corr
+            cov = cov.loc[sort_ix, sort_ix]
+            
+            # 4. Recursive Bisection
+            hrp_weights = self._get_rec_bisection(cov, sort_ix)
+            
+            # Convert to DataFrame
+            weights_series = pd.Series(hrp_weights).sort_values(ascending=False)
+            df_w = pd.DataFrame({'ticker': weights_series.index, 'weight': weights_series.values})
+            
+            logger.info("✅ HRP Optimization Succeeded!")
+            return df_w
+
+        except Exception as e:
+            logger.error(f"HRP Optimization failed: {e}. Fallback to Equal.")
+            return self._get_equal_weights(self.valid_tickers)
+
+    def _get_quasi_diag(self, link):
+        # Sort clustered items by distance
+        link = link.astype(int)
+        sort_ix = pd.Series([link[-1, 0], link[-1, 1]])
+        num_items = link[-1, 3] # Total items
+        
+        while sort_ix.max() >= num_items:
+            sort_ix.index = range(0, sort_ix.shape[0] * 2, 2) # Make space
+            df0 = sort_ix[sort_ix >= num_items] # Clusters
+            i = df0.index
+            j = df0.values - num_items
+            sort_ix[i] = link[j, 0] # Item 1
+            df0 = pd.Series(link[j, 1], index=i + 1)
+            sort_ix = pd.concat([sort_ix, df0]) # Item 2
+            sort_ix = sort_ix.sort_index()
+            sort_ix.index = range(sort_ix.shape[0])
+            
+        return sort_ix.tolist()
+
+    def _get_rec_bisection(self, cov, sort_ix):
+        w = pd.Series(1, index=sort_ix)
+        c_items = [sort_ix]
+        
+        while len(c_items) > 0:
+            c_items = [i[j:k] for i in c_items for j, k in ((0, len(i) // 2), (len(i) // 2, len(i))) if len(i) > 1]
+            for i in range(0, len(c_items), 2):
+                c1 = c_items[i] 
+                c2 = c_items[i + 1]
+                v1 = self._get_cluster_var(cov, c1)
+                v2 = self._get_cluster_var(cov, c2)
+                alpha = 1 - v1 / (v1 + v2)
+                w[c1] *= alpha
+                w[c2] *= 1 - alpha
+        return w
+
+    def _get_cluster_var(self, cov, c_items):
+        # Calculate variance of a cluster
+        cov_slice = cov.loc[c_items, c_items]
+        w = self._get_ivp(cov_slice).values.reshape(-1, 1)
+        c_var = np.dot(np.dot(w.T, cov_slice), w)[0, 0]
+        return c_var
+
+    def _get_ivp(self, cov):
+        # Inverse Variance Portfolio
+        ivp = 1. / np.diag(cov)
+        ivp /= ivp.sum()
+        return pd.Series(ivp, index=cov.index)
 
     def _get_equal_weights(self, ticker_list):
         """辅助函数：生成等权重配置"""

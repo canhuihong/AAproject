@@ -107,8 +107,8 @@ class BacktestEngine:
         # 1. 温和填充 (Soft Fill): 允许最多 3 天的数据缺失 (应对节假日或临时停牌)
         pivot = pivot.ffill(limit=3)
         
-        # 2. 后向填充 (bfill): 修复起始日的缺失
-        pivot = pivot.bfill()
+        # 2. [Deleted] Removed pivot.bfill() to strictly prevent look-ahead bias
+        # pivot = pivot.bfill()
         
         # 3. 统计并丢弃仍有空值的列
         original_cols = len(pivot.columns)
@@ -214,8 +214,11 @@ class BacktestEngine:
         current_capital = self.initial_capital
         prev_weights = {} # 用于计算换手率
         
-        # 遍历每个调仓周期
-        for i in range(len(rebalance_dates) - 1):
+        # [Optimization] Preload Data into Memory
+        self.factor_engine.preload_data()
+        
+        # 3. 逐期回测
+        for i, analysis_date in enumerate(rebalance_dates[:-1]):
             curr_date = rebalance_dates[i]
             next_date = rebalance_dates[i+1]
             date_str = curr_date.strftime('%Y-%m-%d')

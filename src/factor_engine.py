@@ -23,6 +23,53 @@ class FactorEngine:
         # [Cache] Store computed snapshots to avoid redundant regression calls
         # Key: analysis_date (str), Value: DataFrame
         self._score_cache = {}
+        
+        # [Optimization] Vectorized Loading Cache
+        self.price_cache = None
+        self.fund_cache = None
+        self.macro_cache = None
+
+    def preload_data(self):
+        """
+        🚀 Vectorized Loading: Load ALL data into memory once.
+        This drastically speeds up backtesting by avoiding 1000s of SQL queries.
+        """
+        logger.info("🚀 Preloading Data into Memory (Vectorized Mode)...")
+        conn = self.db._get_conn()
+        try:
+            # 1. Prices
+            logger.info("   Loading Prices...")
+            self.price_cache = pd.read_sql("SELECT date, ticker, close, volume FROM prices ORDER BY date", conn)
+            self.price_cache['date'] = pd.to_datetime(self.price_cache['date'])
+            
+            # 2. Fundamentals
+            logger.info("   Loading Fundamentals...")
+            # We fetch all columns needed
+            q = """
+            SELECT 
+                date, ticker, 
+                total_equity, shares_count, net_income, total_revenue, total_assets, operating_cash_flow,
+                long_term_debt, total_current_assets, total_current_liabilities, gross_profit, capital_expenditure
+            FROM fundamentals 
+            ORDER BY date
+            """
+            self.fund_cache = pd.read_sql(q, conn)
+            # FORCE NS for compatibility with merge_asof
+            self.fund_cache['date'] = pd.to_datetime(self.fund_cache['date']).astype('datetime64[ns]')
+            
+            # 3. Macro (VIX, etc)
+            logger.info("   Loading Macro Data...")
+            self.macro_cache = pd.read_sql("SELECT date, ticker, close FROM prices WHERE ticker IN ('^VIX', '^TNX', '^IRX')", conn)
+            self.macro_cache['date'] = pd.to_datetime(self.macro_cache['date'])
+            
+            logger.info(f"✅ Data Loaded. Prices: {len(self.price_cache)}, Fund: {len(self.fund_cache)}")
+            
+        except Exception as e:
+            logger.error(f"Preload failed: {e}")
+            self.price_cache = None
+            self.fund_cache = None
+        finally:
+            conn.close()
 
     def _detect_market_regime(self, analysis_date):
         """
@@ -38,31 +85,53 @@ class FactorEngine:
             return 'NEUTRAL'
             
         try:
-            # 1. Fetch Data Inputs
-            # Lookback window for technicals (SMA200)
-            start_date_tech = (pd.Timestamp(analysis_date) - pd.Timedelta(days=400)).strftime('%Y-%m-%d')
-            
-            conn = self.db._get_conn()
-            
-            # A. Get SPY for Trend
-            df_spy = pd.read_sql(f"SELECT date, close FROM prices WHERE ticker = 'SPY' AND date >= '{start_date_tech}' AND date <= '{analysis_date}' ORDER BY date", conn)
-            
-            # B. Get Macro Indicators (Single Day Snapshot is usually enough, but we take last 5 days to be safe against missing data)
-            start_date_macro = (pd.Timestamp(analysis_date) - pd.Timedelta(days=7)).strftime('%Y-%m-%d')
-            
-            # Fetch VIX, TNX (10Y), IRX (13W ~ 3M)
-            # Note: IRX is yield * 10 (e.g., 4.5 index = 4.5% yield? No, Yahoo ^IRX is usually standard yield)
-            # Let's assume standard % format.
-            df_macro = pd.read_sql(f"SELECT date, ticker, close FROM prices WHERE ticker IN ('^VIX', '^TNX', '^IRX') AND date >= '{start_date_macro}' AND date <= '{analysis_date}'", conn)
-            
-            conn.close()
+            # Optimized Path: Use Cache if available
+            if self.macro_cache is not None:
+                df_macro = self.macro_cache
+                start_date_tech = (pd.Timestamp(analysis_date) - pd.Timedelta(days=400))
+                
+                # Filter in memory
+                mask = (df_macro['date'] >= start_date_tech) & (df_macro['date'] <= pd.Timestamp(analysis_date))
+                subset = df_macro[mask]
+                
+                # Reconstruct format needed below
+                # Need SPY price too... wait, SPY is in price_cache?
+                # Usually SPY is in prices table. 
+                # Let's check if price_cache has SPY. Yes it should.
+                
+                if self.price_cache is not None:
+                    spy_subset = self.price_cache[
+                        (self.price_cache['ticker'] == 'SPY') & 
+                        (self.price_cache['date'] >= start_date_tech) & 
+                        (self.price_cache['date'] <= pd.Timestamp(analysis_date))
+                    ].sort_values('date')
+                else:
+                    # Fallback to SQL if cache partial (shouldn't happen if preloaded)
+                    raise ValueError("Cache not ready")
+
+            else:
+                 # Legacy SQL Path
+                # 1. Fetch Data Inputs
+                # Lookback window for technicals (SMA200)
+                start_date_tech = (pd.Timestamp(analysis_date) - pd.Timedelta(days=400)).strftime('%Y-%m-%d')
+                
+                conn = self.db._get_conn()
+                
+                # A. Get SPY for Trend
+                spy_subset = pd.read_sql(f"SELECT date, close FROM prices WHERE ticker = 'SPY' AND date >= '{start_date_tech}' AND date <= '{analysis_date}' ORDER BY date", conn)
+                
+                # B. Get Macro Indicators 
+                start_date_macro = (pd.Timestamp(analysis_date) - pd.Timedelta(days=7)).strftime('%Y-%m-%d')
+                subset = pd.read_sql(f"SELECT date, ticker, close FROM prices WHERE ticker IN ('^VIX', '^TNX', '^IRX') AND date >= '{start_date_macro}' AND date <= '{analysis_date}'", conn)
+                
+                conn.close()
             
             # --- Technical Score ---
-            if len(df_spy) < 200:
+            if len(spy_subset) < 200:
                 tech_score = 0
             else:
-                sma200 = df_spy['close'].rolling(200).mean().iloc[-1]
-                curr_price = df_spy['close'].iloc[-1]
+                sma200 = spy_subset['close'].rolling(200).mean().iloc[-1]
+                curr_price = spy_subset['close'].iloc[-1]
                 if pd.isna(sma200): tech_score = 0
                 elif curr_price > sma200: tech_score = 1
                 else: tech_score = -1
@@ -71,7 +140,7 @@ class FactorEngine:
             vix_score = 0
             last_vix = 20.0 # Default fallback
             
-            vix_data = df_macro[df_macro['ticker'] == '^VIX'].sort_values('date')
+            vix_data = subset[subset['ticker'] == '^VIX'].sort_values('date')
             if not vix_data.empty:
                 last_vix = vix_data.iloc[-1]['close']
                 
@@ -89,8 +158,8 @@ class FactorEngine:
             # We use ^TNX (10Y) and ^IRX (13W).
             yield_score = 0
             
-            tnx_data = df_macro[df_macro['ticker'] == '^TNX'].sort_values('date')
-            irx_data = df_macro[df_macro['ticker'] == '^IRX'].sort_values('date')
+            tnx_data = subset[subset['ticker'] == '^TNX'].sort_values('date')
+            irx_data = subset[subset['ticker'] == '^IRX'].sort_values('date')
             
             if not tnx_data.empty and not irx_data.empty:
                 t10 = tnx_data.iloc[-1]['close']
@@ -138,6 +207,117 @@ class FactorEngine:
 
     def _get_historical_data(self, analysis_date):
         """Fetch price and fundamentals for the window"""
+        
+        # 🟢 OPTIMIZED PATH (In-Memory)
+        if self.price_cache is not None and self.fund_cache is not None:
+             dt_analysis = pd.Timestamp(analysis_date)
+             dt_start = dt_analysis - pd.Timedelta(days=self.lookback_days * 2 + 20) # Buffer
+             
+             # 1. Filter Prices
+             # Use searchsorted for speed if sorted? Or simple boolean mask is extremely fast for 1M rows anyway.
+             mask_p = (self.price_cache['date'] >= dt_start) & (self.price_cache['date'] <= dt_analysis)
+             df_price = self.price_cache[mask_p].copy()
+             df_price['date'] = df_price['date'].dt.strftime('%Y-%m-%d') # Convert back to str for downstream compatibility? 
+             # Downstream expects 'date' column. The format 'YYYY-MM-DD' string is safer for pivot.
+             
+             # 2. Fundamentals (Pit-in-Time via merge_asof)
+             # We need One row per ticker: The latest report BEFORE or ON analysis_date
+             
+             # Create Target Keys (All tickers that exist)
+             unique_tickers = self.fund_cache['ticker'].unique()
+             keys = pd.DataFrame({'ticker': unique_tickers})
+             keys['date'] = dt_analysis # Target date
+             # FORCE NS
+             keys['date'] = keys['date'].astype('datetime64[ns]')
+             keys = keys.sort_values('date') 
+             
+             # Prepare Fund Cache (must be sorted by date)
+             # usually it is sorted from SQL, but ensure it.
+             # self.fund_cache is sorted by date in preload
+             
+             # Force types to match for merge_asof (ns precision)
+             # self.fund_cache['date'] should be ns, but ensure it logic if needed, 
+             # but better to ensure keys match cache.
+             keys['date'] = keys['date'].astype('datetime64[ns]')
+             # It seems one side might be [s] (seconds). 
+             # To be safe, we check cache type or force it.
+             # Let's assume cache might be anything, so we force cache to ns in preload?
+             # Or just cast here temporarily if cache is huge? No, cast keys is cheap.
+             # But if cache is [s], we must cast cache or cast keys to [s].
+             
+             # Better: Force self.fund_cache to be ns in preload.
+             # But here, we can also ensure it for robustness.
+             # Inspect error: [1] is incompatible. 
+             # Let's cast BOTH to ns to be sure.
+             
+             # MERGE ASOF: Current
+             # "Backward" search: find latest date <= key.date
+             
+             # Note: self.fund_cache is large. Avoid casting it on every loop.
+             # We should fix it in preload_data().
+             # But if we can't edit preload_data now without another call, we do it here?
+             # No, this tool call only edits a chunk.
+             
+             # I'll fix it in preload_data() in a separate Edit?
+             # Or I can try to edit 2 chunks? No, replace_file_content is single chunk.
+             # I will use multi_replace_file_content to fix preload AND usage? 
+             # Or I can just check if I can modify both in one chunk? They are far apart.
+             # I'll use separate edits. Focus on usage site first? 
+             # No, if cache is wrong, usage site fix is messy.
+             # The error likely stems from pd.to_datetime returning different resolution.
+             
+             # Let's fix keys to match whatever standard we want (ns).
+             # And I'll assume I'll fix preload to [ns].
+             
+             keys['date'] = keys['date'].astype('datetime64[ns]')
+             
+             current = pd.merge_asof(
+                 keys, 
+                 self.fund_cache, # We assume optimized mode ensures this is sorted and correct type
+                 on='date', 
+                 by='ticker', 
+                 direction='backward'
+             )
+             
+             # MERGE ASOF: Lagged (1 Year Ago)
+             dt_prev = dt_analysis - pd.Timedelta(days=365)
+             keys_prev = keys.copy()
+             keys_prev['date'] = dt_prev
+             
+             prev = pd.merge_asof(
+                 keys_prev,
+                 self.fund_cache.sort_values('date'),
+                 on='date',
+                 by='ticker',
+                 direction='backward'
+             )
+             
+             # Rename Prev Columns
+             rename_map = {
+                 'net_income': 'prev_net_income',
+                 'total_assets': 'prev_total_assets',
+                 'long_term_debt': 'prev_long_term_debt',
+                 'total_current_assets': 'prev_total_current_assets',
+                 'total_current_liabilities': 'prev_total_current_liabilities',
+                 'shares_count': 'prev_shares_count',
+                 'gross_profit': 'prev_gross_profit',
+                 'total_revenue': 'prev_total_revenue'
+             }
+             prev = prev.rename(columns=rename_map)
+             
+             # Merge Current + Prev
+             # We drop unnecessary columns from prev to avoid collision
+             cols_to_keep = ['ticker'] + list(rename_map.values())
+             prev_subset = prev[cols_to_keep]
+             
+             df_fund = pd.merge(current, prev_subset, on='ticker', how='left')
+             
+             # Filter invalid rows (no data found)
+             df_fund = df_fund.dropna(subset=['total_equity', 'net_income'])
+             
+             return df_price, df_fund
+
+        # 🟠 LEGACY PATH (SQL)
         conn = self.db._get_conn()
         
         # 1. Get Prices (and Volume for liquidity filter)
@@ -552,6 +732,15 @@ class FactorEngine:
             # logger.warning(f"Piotroski Calc Failed: {e}")
             df_res['piotroski'] = 5 # Neutral default
             
+        # [Factor 2.0] Value Factor (FCF Yield + Book-to-Market)
+        # B/M Calculation: Total Equity / Market Cap
+        try:
+             bm_ratio = valid_fund['total_equity'] / (df_res['close'] * valid_fund['shares_count'])
+             bm_ratio = bm_ratio.replace([np.inf, -np.inf], np.nan).fillna(0)
+             df_res['bm_ratio'] = bm_ratio
+        except Exception:
+             df_res['bm_ratio'] = 0.0
+
         # [Factor 2.0] FCF Yield (Value)
         try:
             fcf = valid_fund['operating_cash_flow'] - valid_fund['capital_expenditure']
